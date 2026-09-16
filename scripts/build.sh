@@ -33,6 +33,19 @@ for arg in "$@"; do
   esac
 done
 
+# --- Apply host-side dependency fixes that are not yet merged upstream ---
+CAPSTONE_DIR="${PROJECT_ROOT}/vendor/libcapstone-spm"
+CAPSTONE_PATCH="${PROJECT_ROOT}/scripts/patches/libcapstone-opcount-oob.patch"
+if git -C "$CAPSTONE_DIR" apply --reverse --check "$CAPSTONE_PATCH" >/dev/null 2>&1; then
+  echo "=== libcapstone M1 OOB fix already applied ==="
+elif git -C "$CAPSTONE_DIR" apply --check "$CAPSTONE_PATCH" >/dev/null 2>&1; then
+  echo "=== Applying libcapstone M1 OOB fix ==="
+  git -C "$CAPSTONE_DIR" apply "$CAPSTONE_PATCH"
+else
+  echo "Error: libcapstone OOB patch no longer applies cleanly; inspect upstream before building." >&2
+  exit 1
+fi
+
 # --- Build + sign the binary ---
 echo "=== Building vphone-cli (${GIT_HASH}) ==="
 echo '// Auto-generated — do not edit' > "$BUILD_INFO"

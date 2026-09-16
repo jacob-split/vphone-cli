@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import ImageIO
 
@@ -31,6 +32,9 @@ class VPhoneHostControl {
     private weak var captureView: VPhoneVirtualMachineView?
     private var screenRecorder: VPhoneScreenRecorder?
     private weak var control: VPhoneControl?
+    private weak var cameraServer: VPhoneCameraServer?
+    private weak var touchIDMonitor: VPhoneTouchIDMonitor?
+    private weak var virtualMachine: VPhoneVirtualMachine?
 
     /// Thread-safe box for passing results between main actor and accept queue.
     private final class ResultBox: @unchecked Sendable {
@@ -38,6 +42,7 @@ class VPhoneHostControl {
         var error: String?
         var ok = false
         var imageBase64: String?
+        var data: Any?
     }
 
     /// Screen pixel dimensions for coordinate mapping.
@@ -55,12 +60,18 @@ class VPhoneHostControl {
         captureView: VPhoneVirtualMachineView,
         screenRecorder: VPhoneScreenRecorder,
         control: VPhoneControl,
+        cameraServer: VPhoneCameraServer?,
+        touchIDMonitor: VPhoneTouchIDMonitor?,
+        virtualMachine: VPhoneVirtualMachine,
         screenWidth: Int,
         screenHeight: Int
     ) {
         self.captureView = captureView
         self.screenRecorder = screenRecorder
         self.control = control
+        self.cameraServer = cameraServer
+        self.touchIDMonitor = touchIDMonitor
+        self.virtualMachine = virtualMachine
         self.screenWidth = screenWidth
         self.screenHeight = screenHeight
 
@@ -104,6 +115,10 @@ class VPhoneHostControl {
             print("[hostctl] listen failed: \(String(cString: strerror(errno)))")
             close(fd)
             return
+        }
+
+        socketPath.withCString { path in
+            _ = Darwin.chmod(path, mode_t(S_IRUSR | S_IWUSR))
         }
 
         listenFD = fd
@@ -406,18 +421,358 @@ class VPhoneHostControl {
             semaphore.wait()
             writeResponse(fd, ok: result.ok, error: result.error, image: result.imageBase64)
 
+        case "rpc":
+            let semaphore = DispatchSemaphore(value: 0)
+            let result = ResultBox()
+            Task { @MainActor in
+                defer { semaphore.signal() }
+                guard let controller else {
+                    result.error = "host control unavailable"
+                    return
+                }
+                do {
+                    result.data = try await controller.handleRPC(json)
+                    result.ok = true
+                    if wantScreen {
+                        try? await Task.sleep(nanoseconds: UInt64(screenDelay) * 1_000_000)
+                        result.imageBase64 = await controller.captureCompactScreenshot()
+                    }
+                } catch {
+                    result.error = "\(error)"
+                }
+            }
+            semaphore.wait()
+            writeResponse(
+                fd, ok: result.ok, error: result.error, image: result.imageBase64, data: result.data
+            )
+
         default:
             writeResponse(fd, ok: false, error: "unknown command: \(type)")
+        }
+    }
+
+    // MARK: - Guest RPC
+
+    private func handleRPC(_ json: [String: Any]) async throws -> Any {
+        guard let ctl = control else {
+            throw VPhoneControl.ControlError.notConnected
+        }
+        guard let op = json["op"] as? String, !op.isEmpty else {
+            throw VPhoneControl.ControlError.protocolError("rpc requires op")
+        }
+
+        func string(_ key: String) throws -> String {
+            guard let value = json[key] as? String, !value.isEmpty else {
+                throw VPhoneControl.ControlError.protocolError("\(op) requires \(key)")
+            }
+            return value
+        }
+        func number(_ key: String, default fallback: Double? = nil) throws -> Double {
+            if let n = json[key] as? NSNumber { return n.doubleValue }
+            if let fallback { return fallback }
+            throw VPhoneControl.ControlError.protocolError("\(op) requires numeric \(key)")
+        }
+        func requireConnected() throws {
+            guard ctl.isConnected else { throw VPhoneControl.ControlError.notConnected }
+        }
+        func writeHostData(_ data: Data, to path: String) throws {
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            try data.write(to: url, options: .atomic)
+        }
+
+        switch op {
+        case "status":
+            return [
+                "connected": ctl.isConnected,
+                "guest_name": ctl.guestName,
+                "guest_ip": ctl.guestIP ?? NSNull(),
+                "ios_version": ctl.guestIOSVersion ?? NSNull(),
+                "capabilities": ctl.guestCaps,
+                "variant": String(describing: ctl.variant),
+                "socket": socketPath,
+            ] as [String: Any]
+
+        case "ping":
+            try await ctl.sendPing()
+            return ["pong": true]
+
+        case "version":
+            return ["hash": try await ctl.sendVersion()]
+
+        case "devmode_status":
+            return ["enabled": try await ctl.sendDevModeStatus().enabled]
+
+        case "file_list":
+            return try await ctl.listFiles(path: string("path"))
+
+        case "file_download":
+            let guestPath = try string("path")
+            let hostPath = try string("host_path")
+            let data = try await ctl.downloadFile(path: guestPath)
+            try writeHostData(data, to: hostPath)
+            return ["host_path": hostPath, "bytes": data.count]
+
+        case "file_upload":
+            let hostPath = try string("host_path")
+            let guestPath = try string("path")
+            let data = try Data(contentsOf: URL(fileURLWithPath: hostPath))
+            try await ctl.uploadFile(
+                path: guestPath, data: data, permissions: json["permissions"] as? String ?? "644"
+            )
+            return ["path": guestPath, "bytes": data.count]
+
+        case "file_mkdir":
+            try await ctl.createDirectory(path: string("path"))
+            return ["created": true]
+
+        case "file_delete":
+            try await ctl.deleteFile(path: string("path"))
+            return ["deleted": true]
+
+        case "file_rename":
+            try await ctl.renameFile(from: string("from"), to: string("to"))
+            return ["renamed": true]
+
+        case "install_ipa":
+            let hostPath = try string("host_path")
+            let message = try await ctl.installIPA(localURL: URL(fileURLWithPath: hostPath))
+            return ["message": message]
+
+        case "keychain_list":
+            let result = try await ctl.listKeychainItems(filterClass: json["class"] as? String)
+            return ["items": result.items, "diagnostics": result.diagnostics]
+
+        case "keychain_add":
+            let ok = try await ctl.addKeychainItem(
+                account: json["account"] as? String ?? "vphone-test",
+                service: json["service"] as? String ?? "vphone",
+                password: json["password"] as? String ?? "testpass123"
+            )
+            return ["added": ok]
+
+        case "clipboard_get":
+            let content = try await ctl.clipboardGet()
+            var result: [String: Any] = [
+                "text": content.text ?? NSNull(),
+                "types": content.types,
+                "has_image": content.hasImage,
+                "change_count": content.changeCount,
+                "image_bytes": content.imageData?.count ?? 0,
+            ]
+            if let imageData = content.imageData, let hostPath = json["image_path"] as? String {
+                try writeHostData(imageData, to: hostPath)
+                result["image_path"] = hostPath
+            }
+            return result
+
+        case "clipboard_set_text":
+            try await ctl.clipboardSet(text: string("text"))
+            return ["set": true]
+
+        case "clipboard_set_image":
+            let hostPath = try string("host_path")
+            try await ctl.clipboardSet(imageData: Data(contentsOf: URL(fileURLWithPath: hostPath)))
+            return ["set": true]
+
+        case "app_list":
+            return try await ctl.appList(filter: json["filter"] as? String ?? "all").map { app in
+                [
+                    "bundle_id": app.bundleId, "name": app.name, "version": app.version,
+                    "type": app.type, "state": app.state, "pid": app.pid, "path": app.path,
+                    "data_container": app.dataContainer,
+                ] as [String: Any]
+            }
+
+        case "app_launch":
+            let pid = try await ctl.appLaunch(
+                bundleId: string("bundle_id"), url: json["url"] as? String
+            )
+            return ["pid": pid]
+
+        case "app_terminate":
+            try await ctl.appTerminate(bundleId: string("bundle_id"))
+            return ["terminated": true]
+
+        case "app_foreground":
+            let app = try await ctl.appForeground()
+            return ["bundle_id": app.bundleId, "name": app.name, "pid": app.pid]
+
+        case "open_url":
+            try await ctl.openURL(string("url"))
+            return ["opened": true]
+
+        case "settings_get":
+            let value = try await ctl.settingsGet(
+                domain: string("domain"), key: json["key"] as? String
+            )
+            return ["value": value ?? NSNull()]
+
+        case "settings_set":
+            guard let value = json["value"] else {
+                throw VPhoneControl.ControlError.protocolError("settings_set requires value")
+            }
+            try await ctl.settingsSet(
+                domain: string("domain"), key: string("key"), value: value,
+                type: json["value_type"] as? String
+            )
+            return ["set": true]
+
+        case "low_power_mode":
+            guard let enabled = json["enabled"] as? Bool else {
+                throw VPhoneControl.ControlError.protocolError("low_power_mode requires enabled")
+            }
+            try await ctl.lowPowerMode(enabled: enabled)
+            return ["enabled": enabled]
+
+        case "accessibility_tree":
+            return try await ctl.accessibilityTree(depth: (json["depth"] as? NSNumber)?.intValue ?? -1)
+
+        case "location_set":
+            try requireConnected()
+            let lat = try number("latitude")
+            let lon = try number("longitude")
+            ctl.sendLocation(
+                latitude: lat, longitude: lon, altitude: try number("altitude", default: 0),
+                horizontalAccuracy: try number("horizontal_accuracy", default: 5),
+                verticalAccuracy: try number("vertical_accuracy", default: 5),
+                speed: try number("speed", default: 0), course: try number("course", default: 0)
+            )
+            return ["latitude": lat, "longitude": lon]
+
+        case "location_stop":
+            try requireConnected()
+            ctl.sendLocationStop()
+            return ["stopped": true]
+
+        case "camera_status":
+            guard let cameraServer else {
+                throw VPhoneControl.ControlError.protocolError("camera server unavailable")
+            }
+            return [
+                "connected": cameraServer.isConnected,
+                "source": cameraServer.sourceKind.rawValue,
+                "streaming": cameraServer.isStreaming,
+                "width": VPhoneCameraServer.defaultWidth,
+                "height": VPhoneCameraServer.defaultHeight,
+                "fps": VPhoneCameraServer.defaultFPS,
+            ] as [String: Any]
+
+        case "camera_source":
+            guard let cameraServer else {
+                throw VPhoneControl.ControlError.protocolError("camera server unavailable")
+            }
+            let source = try string("source")
+            switch source {
+            case "off":
+                cameraServer.setSource(.off)
+            case "testPattern", "test_pattern":
+                cameraServer.setSource(.testPattern)
+            case "videoFile", "video_file":
+                let hostPath = try string("host_path")
+                cameraServer.setSource(.videoFile, videoURL: URL(fileURLWithPath: hostPath))
+            default:
+                throw VPhoneControl.ControlError.protocolError(
+                    "camera_source source must be off, test_pattern, or video_file"
+                )
+            }
+            return ["source": cameraServer.sourceKind.rawValue]
+
+        case "camera_start":
+            guard let cameraServer else {
+                throw VPhoneControl.ControlError.protocolError("camera server unavailable")
+            }
+            cameraServer.startStreaming()
+            return ["streaming": cameraServer.isStreaming]
+
+        case "camera_stop":
+            guard let cameraServer else {
+                throw VPhoneControl.ControlError.protocolError("camera server unavailable")
+            }
+            cameraServer.stopStreaming()
+            return ["streaming": cameraServer.isStreaming]
+
+        case "recording_status":
+            return ["recording": screenRecorder?.isRecording ?? false]
+
+        case "recording_start":
+            guard let recorder = screenRecorder, let captureView else {
+                throw VPhoneControl.ControlError.protocolError("screen recorder unavailable")
+            }
+            if !recorder.isRecording { try recorder.startRecording(view: captureView) }
+            return ["recording": recorder.isRecording]
+
+        case "recording_stop":
+            guard let recorder = screenRecorder else {
+                throw VPhoneControl.ControlError.protocolError("screen recorder unavailable")
+            }
+            let url = await recorder.stopRecording()
+            var result: [String: Any] = ["recording": false]
+            result["path"] = url?.path ?? NSNull() as Any
+            return result
+
+        case "touchid_status":
+            guard let monitor = touchIDMonitor else {
+                throw VPhoneControl.ControlError.protocolError("Touch ID monitor unavailable")
+            }
+            return ["enabled": monitor.isEnabled]
+
+        case "touchid_set":
+            guard let monitor = touchIDMonitor, let enabled = json["enabled"] as? Bool else {
+                throw VPhoneControl.ControlError.protocolError("touchid_set requires enabled")
+            }
+            monitor.isEnabled = enabled
+            return ["enabled": monitor.isEnabled]
+
+        case "battery_set":
+            guard let vm = virtualMachine else {
+                throw VPhoneControl.ControlError.protocolError("virtual machine unavailable")
+            }
+            let charge = try number("charge")
+            guard (0 ... 100).contains(charge) else {
+                throw VPhoneControl.ControlError.protocolError("battery charge must be 0...100")
+            }
+            let connectivity = (json["connectivity"] as? NSNumber)?.intValue ?? 2
+            guard connectivity == 1 || connectivity == 2 else {
+                throw VPhoneControl.ControlError.protocolError(
+                    "battery connectivity must be 1 (charging) or 2 (disconnected)"
+                )
+            }
+            vm.setBattery(charge: charge, connectivity: connectivity)
+            return ["charge": charge, "connectivity": connectivity]
+
+        case "raw_request":
+            guard var request = json["request"] as? [String: Any], request["t"] != nil else {
+                throw VPhoneControl.ControlError.protocolError("raw_request requires request with t")
+            }
+            request.removeValue(forKey: "id")
+            request.removeValue(forKey: "v")
+            let (response, rawData) = try await ctl.sendRequest(request)
+            var result: [String: Any] = ["response": response]
+            if let rawData {
+                result["raw_bytes"] = rawData.count
+                if let hostPath = json["host_output_path"] as? String {
+                    try writeHostData(rawData, to: hostPath)
+                    result["host_output_path"] = hostPath
+                }
+            }
+            return result
+
+        default:
+            throw VPhoneControl.ControlError.protocolError("unknown rpc op: \(op)")
         }
     }
 
     // MARK: - Socket I/O
 
     private nonisolated static func readLine(from fd: Int32) -> String? {
+        let maxRequestBytes = 64 * 1024
         var buffer = [UInt8](repeating: 0, count: 4096)
         var accumulated = Data()
 
-        while accumulated.count < 4096 {
+        while accumulated.count < maxRequestBytes {
             let n = read(fd, &buffer, buffer.count)
             guard n > 0 else { break }
             accumulated.append(contentsOf: buffer[..<n])
@@ -431,14 +786,17 @@ class VPhoneHostControl {
     }
 
     private nonisolated static func writeResponse(
-        _ fd: Int32, ok: Bool, path: String? = nil, error: String? = nil, image: String? = nil
+        _ fd: Int32, ok: Bool, path: String? = nil, error: String? = nil, image: String? = nil,
+        data: Any? = nil
     ) {
         var dict: [String: Any] = ["ok": ok]
         if let path { dict["path"] = path }
         if let error { dict["error"] = error }
         if let image { dict["image"] = image }
+        if let data { dict["data"] = data }
 
-        guard let data = try? JSONSerialization.data(withJSONObject: dict),
+        guard JSONSerialization.isValidJSONObject(dict),
+              let data = try? JSONSerialization.data(withJSONObject: dict),
               var json = String(data: data, encoding: .utf8)
         else { return }
 

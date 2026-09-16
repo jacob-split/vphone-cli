@@ -34,6 +34,7 @@ final class VPhoneCameraServer {
 
     private(set) var sourceKind: SourceKind = .off
     private(set) var isConnected = false
+    var isStreaming: Bool { timer != nil }
 
     private var device: VZVirtioSocketDevice?
     private var connection: VZVirtioSocketConnection?

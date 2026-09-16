@@ -160,6 +160,9 @@ class VPhoneAppDelegate: NSObject, NSApplicationDelegate {
                 captureView: wc.captureView!,
                 screenRecorder: recorder,
                 control: control,
+                cameraServer: cameraServer,
+                touchIDMonitor: wc.touchIDMonitor,
+                virtualMachine: vm,
                 screenWidth: options.screenWidth,
                 screenHeight: options.screenHeight
             )

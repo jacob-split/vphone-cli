@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vphone-codex-mcp"
+version = "0.1.0"
+description = "Codex MCP control plane for vphone-cli"
+requires-python = ">=3.13"
+dependencies = ["mcp[cli]>=2.2,<3"]
+
+[project.scripts]
+vphone-mcp = "vphone_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vphone_mcp*"]

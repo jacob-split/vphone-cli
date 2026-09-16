@@ -11,8 +11,8 @@ VM_DIR_ABS  := $(abspath $(VM_DIR))
 # CPU cores, memory (MB), disk size (GB) — used only during vm_new.
 # NB: no inline comments on these `?=` lines — make would fold the trailing
 # whitespace into the value (e.g. CPU="8   ") and break numeric consumers.
-CPU         ?= 8
-MEMORY      ?= 8192
+CPU         ?= 4
+MEMORY      ?= 4096
 DISK_SIZE   ?= 64
 BACKUPS_DIR ?= vm.backups
 NAME        ?=
@@ -33,6 +33,10 @@ BUNDLE      := .build/vphone-cli.app
 BUNDLE_BIN  := $(BUNDLE)/Contents/MacOS/vphone-cli
 INFO_PLIST  := sources/Info.plist
 ENTITLEMENTS := sources/vphone.entitlements
+CAPSTONE_DIR := vendor/libcapstone-spm
+CAPSTONE_SOURCE := $(CAPSTONE_DIR)/Sources/Capstone/Instruction.swift
+CAPSTONE_PATCH := scripts/patches/libcapstone-opcount-oob.patch
+CAPSTONE_PATCH_STAMP := .build/vendor-patches/libcapstone-opcount-oob.stamp
 VENV        := .venv
 TOOLS_PREFIX := .tools
 PMD3_BRIDGE := $(CURDIR)/$(SCRIPTS)/pymobiledevice3_bridge.py
@@ -202,19 +206,34 @@ clean:
 # Build
 # ═══════════════════════════════════════════════════════════════════
 
-.PHONY: build patcher_build bundle
+.PHONY: build patcher_build bundle prepare_vendor
+
+prepare_vendor: $(CAPSTONE_PATCH_STAMP)
+
+$(CAPSTONE_PATCH_STAMP): $(CAPSTONE_PATCH) $(CAPSTONE_SOURCE)
+	@mkdir -p $(dir $@)
+	@if git -C $(CAPSTONE_DIR) apply --reverse --check $(CURDIR)/$(CAPSTONE_PATCH) >/dev/null 2>&1; then \
+		echo "=== libcapstone M1 OOB fix already applied ==="; \
+	elif git -C $(CAPSTONE_DIR) apply --check $(CURDIR)/$(CAPSTONE_PATCH) >/dev/null 2>&1; then \
+		echo "=== Applying libcapstone M1 OOB fix ==="; \
+		git -C $(CAPSTONE_DIR) apply $(CURDIR)/$(CAPSTONE_PATCH); \
+	else \
+		echo "Error: libcapstone OOB patch no longer applies cleanly; inspect upstream before building." >&2; \
+		exit 1; \
+	fi
+	@touch $@
 
 build: $(BINARY)
 
 patcher_build: $(PATCHER_BINARY)
 
-$(PATCHER_BINARY): $(SWIFT_SOURCES) Package.swift
+$(PATCHER_BINARY): $(SWIFT_SOURCES) Package.swift $(CAPSTONE_PATCH_STAMP)
 	@echo "=== Building vphone-cli patcher ($(GIT_HASH)) ==="
 	@echo '// Auto-generated — do not edit' > $(BUILD_INFO)
 	@echo 'enum VPhoneBuildInfo { static let commitHash = "$(GIT_HASH)" }' >> $(BUILD_INFO)
 	@set -o pipefail; swift build 2>&1 | tail -5
 
-$(BINARY): $(SWIFT_SOURCES) Package.swift $(ENTITLEMENTS)
+$(BINARY): $(SWIFT_SOURCES) Package.swift $(ENTITLEMENTS) $(CAPSTONE_PATCH_STAMP)
 	@echo "=== Building vphone-cli ($(GIT_HASH)) ==="
 	@echo '// Auto-generated — do not edit' > $(BUILD_INFO)
 	@echo 'enum VPhoneBuildInfo { static let commitHash = "$(GIT_HASH)" }' >> $(BUILD_INFO)

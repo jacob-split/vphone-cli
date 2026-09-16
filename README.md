@@ -195,7 +195,7 @@ vphone-amfidont         # .build/vphone-cli.app/Contents/Resources/vphone-amfido
 
 ## Automation
 
-`vphone-cli` exposes a host control socket (`<bundle>/vphone.sock`) for programmatic control — screenshots, touch, swipes, hardware keys, clipboard — each action returning an inline screenshot for AI-driven E2E testing. See [vphone-mcp](https://github.com/pluginslab/vphone-mcp) for an MCP server wrapping it.
+`vphone-cli` exposes an owner-only host control socket (`<bundle>/vphone.sock`) for AI-driven E2E testing. It supports screenshots/touch/keys plus guest apps, IPA installation, files, clipboard, URLs, settings, location, camera streaming, screen recording, battery simulation, Touch ID forwarding, keychain access, and raw `vphoned` RPC. For Codex, use the maintained MCP integration in [`docs/CODEX_MCP.md`](docs/CODEX_MCP.md); the external [vphone-mcp](https://github.com/pluginslab/vphone-mcp) remains a smaller UI-automation wrapper.
 
 ## Acknowledgements
 
