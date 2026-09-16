@@ -340,6 +340,7 @@ static BOOL handle_client(int fd) {
     [caps addObject:@"url"];
     [caps addObject:@"settings"];
     [caps addObject:@"touch"];
+    [caps addObject:@"accessibility_semantic"];
 
     NSMutableDictionary *helloResp = [@{
       @"v" : @PROTOCOL_VERSION,
@@ -437,8 +438,8 @@ static BOOL handle_client(int fd) {
           continue;
         }
 
-        // Accessibility tree
-        if ([t isEqualToString:@"accessibility_tree"]) {
+        // Semantic accessibility (SpringBoard VPhoneAX broker)
+        if ([t hasPrefix:@"accessibility_"]) {
           NSDictionary *resp = vp_handle_accessibility_command(msg);
           if (resp && !vp_write_message(fd, resp))
             break;

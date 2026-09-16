@@ -35,7 +35,7 @@ NSDictionary *vp_read_message(int fd) {
     uint32_t header = 0;
     if (!vp_read_fully(fd, &header, 4)) return nil;
     uint32_t length = ntohl(header);
-    if (length == 0 || length > 4 * 1024 * 1024) return nil;
+    if (length == 0 || length > 32 * 1024 * 1024) return nil;
 
     NSMutableData *payload = [NSMutableData dataWithLength:length];
     if (!vp_read_fully(fd, payload.mutableBytes, length)) return nil;

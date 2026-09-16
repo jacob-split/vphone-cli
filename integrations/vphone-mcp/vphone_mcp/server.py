@@ -6,6 +6,7 @@ import os
 import shutil
 import socket
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +30,11 @@ server = MCPServer(
     "vphone",
     description="Full Codex control plane for local vphone-cli virtual iPhones.",
     instructions=(
-        "Resolve a running VM first. Prefer guest/app/file RPC operations over coordinate UI automation. "
-        "Use screenshots to verify UI changes. The accessibility_tree capability is experimental in the "
-        "current guest daemon and may report that it is not implemented. Sensitive keychain/raw requests "
-        "are exposed for explicit use but should not be invoked unless needed."
+        "Resolve a running VM first. Prefer semantic ui_find/ui_tap/ui_type/ui_wait over coordinate UI "
+        "automation, then app/file RPC operations, and use screenshots as a visual fallback/verification. "
+        "Semantic actions re-resolve their target immediately before acting and return ambiguity instead "
+        "of guessing. Sensitive keychain/raw requests are exposed for explicit use but should not be "
+        "invoked unless needed."
     ),
 )
 
@@ -199,12 +201,12 @@ def vm_info(vm: str) -> dict[str, Any]:
 @server.tool()
 def vm_create(
     vm: str,
-    variant: str = "dev",
+    variant: str = "jb",
     cpu: int = 4,
     memory_mb: int = 4096,
     disk_gb: int = 64,
 ) -> str:
-    """Create a virtual iPhone end-to-end. This downloads firmware and performs restore/CFW setup."""
+    """Create a virtual iPhone end-to-end. Defaults to jb so the semantic VPhoneAX broker is installed."""
     if variant not in {"less", "regular", "dev", "jb", "exp"}:
         raise ValueError("variant must be less, regular, dev, jb, or exp")
     result = _run_cli(
@@ -459,10 +461,204 @@ def location_stop(vm: str | None = None) -> dict[str, Any]:
     return _rpc("location_stop", vm=vm)
 
 
+def _ui_selector(
+    identifier: str | None = None,
+    label: str | None = None,
+    role: str | None = None,
+    value: str | None = None,
+    contains: bool = False,
+    index: int | None = None,
+    visible: bool | None = True,
+    clickable: bool | None = None,
+) -> dict[str, Any]:
+    selector: dict[str, Any] = {}
+    if identifier is not None:
+        selector["identifier"] = identifier
+    if label is not None:
+        selector["label"] = label
+    if role is not None:
+        selector["role"] = role
+    if value is not None:
+        selector["value"] = value
+    if contains:
+        selector["contains"] = True
+    if index is not None:
+        if index < 0:
+            raise ValueError("index must be >= 0")
+        selector["index"] = index
+    if visible is not None:
+        selector["visible"] = visible
+    if clickable is not None:
+        selector["clickable"] = clickable
+    if not any(k in selector for k in ("identifier", "label", "role", "value")):
+        raise ValueError("semantic selector requires identifier, label, role, or value")
+    return selector
+
+
 @server.tool()
-def accessibility_tree(depth: int = 4, vm: str | None = None) -> dict[str, Any]:
-    """Request the experimental guest accessibility tree. Current vphoned builds may report it unimplemented."""
-    return _rpc("accessibility_tree", vm=vm, depth=depth)
+def ui_status(vm: str | None = None) -> dict[str, Any]:
+    """Return SpringBoard semantic-accessibility runtime, broker, and frontmost-app status."""
+    return _rpc("accessibility_status", vm=vm)
+
+
+@server.tool()
+def ui_bootstrap(vm: str | None = None) -> dict[str, Any]:
+    """Re-prime the guest AXRuntime/AccessibilityUI semantic broker."""
+    return _rpc("accessibility_bootstrap", vm=vm)
+
+
+@server.tool()
+def ui_tree(
+    mode: str = "compact",
+    max_depth: int = 20,
+    max_elements: int = 500,
+    visible_only: bool = True,
+    clickable_only: bool = False,
+    vm: str | None = None,
+) -> dict[str, Any]:
+    """Return the current semantic UI. Use compact by default; tree/full is diagnostic and bounded."""
+    if mode not in {"compact", "tree", "full", "raw"}:
+        raise ValueError("mode must be compact, tree, full, or raw")
+    if not 1 <= max_elements <= 2000:
+        raise ValueError("max_elements must be between 1 and 2000")
+    if not 0 <= max_depth <= 60:
+        raise ValueError("max_depth must be between 0 and 60")
+    return _rpc(
+        "accessibility_tree", vm=vm, mode=mode, max_depth=max_depth,
+        max_elements=max_elements, visible_only=visible_only, clickable_only=clickable_only,
+    )
+
+
+@server.tool()
+def accessibility_tree(depth: int = 20, vm: str | None = None) -> dict[str, Any]:
+    """Backward-compatible full semantic accessibility-tree request."""
+    return ui_tree(mode="tree", max_depth=depth, max_elements=500, vm=vm)
+
+
+@server.tool()
+def ui_find(
+    identifier: str | None = None,
+    label: str | None = None,
+    role: str | None = None,
+    value: str | None = None,
+    contains: bool = False,
+    index: int | None = None,
+    visible: bool | None = True,
+    clickable: bool | None = None,
+    deep: bool = True,
+    max_depth: int = 20,
+    max_elements: int = 1000,
+    vm: str | None = None,
+) -> dict[str, Any]:
+    """Find one semantic UI element. Equal matches return ambiguity instead of choosing silently."""
+    selector = _ui_selector(identifier, label, role, value, contains, index, visible, clickable)
+    return _rpc(
+        "accessibility_find", vm=vm, selector=selector, deep=deep,
+        max_depth=max_depth, max_elements=max_elements,
+    )
+
+
+@server.tool()
+def ui_tap(
+    identifier: str | None = None,
+    label: str | None = None,
+    role: str | None = None,
+    value: str | None = None,
+    contains: bool = False,
+    index: int | None = None,
+    visible: bool | None = True,
+    max_depth: int = 20,
+    vm: str | None = None,
+) -> dict[str, Any]:
+    """Re-resolve a semantic target and tap its current geometry atomically."""
+    selector = _ui_selector(identifier, label, role, value, contains, index, visible, True)
+    return _rpc(
+        "accessibility_action", vm=vm, selector=selector, action="tap", max_depth=max_depth,
+    )
+
+
+@server.tool()
+def ui_type(
+    text: str,
+    identifier: str | None = None,
+    label: str | None = None,
+    role: str | None = None,
+    value: str | None = None,
+    contains: bool = False,
+    index: int | None = None,
+    visible: bool | None = True,
+    method: str = "paste",
+    verify: bool = True,
+    max_depth: int = 20,
+    vm: str | None = None,
+) -> dict[str, Any]:
+    """Tap a semantic text target and enter text. Paste supports arbitrary Unicode; keys is ASCII-only."""
+    if method not in {"paste", "keys"}:
+        raise ValueError("method must be paste or keys")
+    selector = _ui_selector(identifier, label, role, value, contains, index, visible, True)
+    action = _rpc(
+        "accessibility_action", vm=vm, selector=selector, action="tap", max_depth=max_depth,
+    )
+    if not action.get("ok"):
+        return {"ok": False, "stage": "resolve_and_tap", "action": action}
+    typed = _rpc("type_text", vm=vm, text=text, method=method)
+    result: dict[str, Any] = {"ok": True, "action": action, "typed": typed}
+    if verify:
+        time.sleep(0.25)
+        result["resolved_after"] = _rpc(
+            "accessibility_find", vm=vm, selector=selector, deep=True,
+            max_depth=max_depth, max_elements=1000,
+        )
+    return result
+
+
+@server.tool()
+def ui_wait(
+    condition: str = "present",
+    timeout: float = 10.0,
+    interval: float = 0.25,
+    identifier: str | None = None,
+    label: str | None = None,
+    role: str | None = None,
+    value: str | None = None,
+    contains: bool = False,
+    index: int | None = None,
+    visible: bool | None = True,
+    clickable: bool | None = None,
+    max_depth: int = 20,
+    vm: str | None = None,
+) -> dict[str, Any]:
+    """Wait for a semantic element to become present or absent without screenshot polling."""
+    if condition not in {"present", "absent"}:
+        raise ValueError("condition must be present or absent")
+    if timeout < 0 or timeout > 60:
+        raise ValueError("timeout must be between 0 and 60 seconds")
+    if interval < 0.1 or interval > 5:
+        raise ValueError("interval must be between 0.1 and 5 seconds")
+    selector = _ui_selector(identifier, label, role, value, contains, index, visible, clickable)
+    deadline = time.monotonic() + timeout
+    last: dict[str, Any] | None = None
+    while True:
+        last = _rpc(
+            "accessibility_find", vm=vm, selector=selector, deep=True,
+            max_depth=max_depth, max_elements=1000,
+        )
+        if condition == "present":
+            if last.get("ok"):
+                return {"ok": True, "condition": condition, "result": last}
+            if last.get("error") == "ambiguous":
+                return {"ok": False, "condition": condition, "error": "ambiguous", "result": last}
+        elif last.get("error") == "not_found":
+            return {"ok": True, "condition": condition, "result": last}
+        if time.monotonic() >= deadline:
+            return {"ok": False, "condition": condition, "error": "timeout", "last": last}
+        time.sleep(interval)
+
+
+@server.tool()
+def ui_at_point(x: float, y: float, vm: str | None = None) -> dict[str, Any]:
+    """Return the semantic accessibility element currently under one screen point."""
+    return _rpc("accessibility_hit_test", vm=vm, x=x, y=y)
 
 
 @server.tool()

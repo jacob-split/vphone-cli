@@ -163,6 +163,7 @@ class VPhoneAppDelegate: NSObject, NSApplicationDelegate {
                 cameraServer: cameraServer,
                 touchIDMonitor: wc.touchIDMonitor,
                 virtualMachine: vm,
+                keyHelper: keyHelper,
                 screenWidth: options.screenWidth,
                 screenHeight: options.screenHeight
             )

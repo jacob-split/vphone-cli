@@ -85,6 +85,16 @@ ldid_sign_ent() {
     ldid "${args[@]}" "$file"
 }
 
+build_vphoneax() {
+    local src_dir="$SCRIPT_DIR/vphoneax"
+    local out="$src_dir/VPhoneAX.dylib"
+    [[ -f "$src_dir/Makefile" ]] || die "Missing VPhoneAX source at $src_dir"
+    echo "  Building VPhoneAX semantic accessibility broker..." >&2
+    make -C "$src_dir" >/dev/null
+    [[ -f "$out" ]] || die "VPhoneAX build did not produce $out"
+    echo "$out"
+}
+
 build_tweakloader() {
     local src="$SCRIPT_DIR/tweakloader/TweakLoader.m"
     local out="$TEMP_DIR/TweakLoader.dylib"
@@ -417,6 +427,22 @@ cp -R "$TWEAKLOADER_OUT" "$MNT5/$BOOT_HASH/$JB_DIR_NAME/procursus/usr/lib/TweakL
 /bin/chmod 0755 $MNT5/$BOOT_HASH/$JB_DIR_NAME/procursus/usr/lib/TweakLoader.dylib
 
 echo "  [+] TweakLoader installed to procursus/usr/lib/TweakLoader.dylib"
+
+# ═══════════ JB-4b INSTALL VPHONEAX SEMANTIC BROKER ═══════════
+echo ""
+echo "[JB-4b] Installing VPhoneAX semantic accessibility broker..."
+VPHONEAX_BUILT="$(build_vphoneax)"
+VPHONEAX_SIGNED="$TEMP_DIR/VPhoneAX.dylib"
+cp "$VPHONEAX_BUILT" "$VPHONEAX_SIGNED"
+ldid_sign "$VPHONEAX_SIGNED"
+VPHONEAX_TWEAK_DIR="$MNT5/$BOOT_HASH/$JB_DIR_NAME/procursus/Library/MobileSubstrate/DynamicLibraries"
+/bin/mkdir -p "$VPHONEAX_TWEAK_DIR"
+cp -R "$VPHONEAX_SIGNED" "$VPHONEAX_TWEAK_DIR/VPhoneAX.dylib"
+cp -R "$SCRIPT_DIR/vphoneax/VPhoneAX.plist" "$VPHONEAX_TWEAK_DIR/VPhoneAX.plist"
+/usr/sbin/chown 0:0 "$VPHONEAX_TWEAK_DIR/VPhoneAX.dylib" "$VPHONEAX_TWEAK_DIR/VPhoneAX.plist"
+/bin/chmod 0755 "$VPHONEAX_TWEAK_DIR/VPhoneAX.dylib"
+/bin/chmod 0644 "$VPHONEAX_TWEAK_DIR/VPhoneAX.plist"
+echo "  [+] VPhoneAX installed (SpringBoard-only)"
 
 # ═══════════ JB-5 DEPLOY FIRST-BOOT SETUP ══════════════════════
 echo ""

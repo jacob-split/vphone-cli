@@ -101,6 +101,13 @@ chown 0:0 /var/jb/Library /var/jb/Library/MobileSubstrate /var/jb/Library/Mobile
 chmod 0755 /var/jb/Library /var/jb/Library/MobileSubstrate /var/jb/Library/MobileSubstrate/DynamicLibraries
 log "  Ownership set"
 
+# VPhoneAX broker socket/state directory. SpringBoard runs as mobile and the
+# semantic broker creates an owner-only Unix socket here.
+mkdir -p /var/mobile/Library/VPhoneAX
+chown 501:501 /var/mobile/Library/VPhoneAX
+chmod 0770 /var/mobile/Library/VPhoneAX
+log "  VPhoneAX state directory ready"
+
 log "[2a/8] Preparing dropbear host keys..."
 mkdir -p /var/dropbear
 DROPBEARKEY=""

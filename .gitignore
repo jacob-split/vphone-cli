@@ -337,3 +337,6 @@ setup_logs/
 # Local Codex MCP runtime
 .mcp-venv/
 **/__pycache__/
+
+# vphone semantic accessibility build artifact
+scripts/vphoneax/VPhoneAX.dylib

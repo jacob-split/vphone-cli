@@ -6,6 +6,8 @@ This repository includes an owned MCP server under `integrations/vphone-mcp` so 
 
 On an 8 GB Apple Silicon Mac, the local defaults are 4 vCPUs and 4096 MB guest RAM. The virtual disk remains a sparse 64 GB file, so it grows as the guest writes data instead of reserving 64 GB immediately.
 
+Codex VM creation defaults to the `jb` variant because semantic UI control requires the SpringBoard tweak-loading path. `jb` and `exp` install VPhoneAX automatically; `regular`, `dev`, and `less` do not currently provide the SpringBoard semantic broker.
+
 ## One-time host security gate
 
 PV=3 research guests require host policy changes that cannot be made from a normal macOS session. If `scripts/boot_host_preflight.sh` reports `Allow Research Guests status: disabled`, boot Recovery OS and run:
@@ -36,11 +38,15 @@ The installer creates an isolated `.mcp-venv`, installs the MCP package, install
 
 ## Control surface
 
-The MCP exposes VM lifecycle, host doctor, screenshot/tap/swipe/keys, app lifecycle, IPA installation, guest files, clipboard, URLs, settings, Developer Mode status, low-power mode, simulated location, virtual camera, host screen recording, Touch ID forwarding, battery simulation, keychain access, and a raw vphoned request escape hatch.
+The MCP exposes VM lifecycle, host doctor, screenshots, raw touch/swipe/keys, app lifecycle, IPA installation, guest files, clipboard, URLs, settings, Developer Mode status, low-power mode, simulated location, virtual camera, host screen recording, Touch ID forwarding, battery simulation, keychain access, and a raw vphoned request escape hatch.
+
+Semantic UI control is the preferred automation path. `VPhoneAX.dylib` runs only inside SpringBoard, dynamically boots AXRuntime/AccessibilityUI, resolves the frontmost application, and serves semantic UI over `/var/mobile/Library/VPhoneAX/vphone-ax.sock`. `vphoned` proxies that broker over vsock; Codex never connects to SpringBoard directly. The JB CFW installer builds, signs, and stages VPhoneAX automatically. Vendored AXRuntime bridge code under `scripts/vphoneax/vendor/ios-mcp` retains its MIT license.
+
+Codex semantic tools are `ui_status`, `ui_bootstrap`, `ui_tree`, `ui_find`, `ui_tap`, `ui_type`, `ui_wait`, and `ui_at_point`. Compact semantic queries are the default. Full trees are bounded to prevent runaway AX traversals. Selectors prefer exact accessibility identifiers, then role/label/value matches; equal-best matches return `ambiguous` instead of choosing silently. Semantic actions re-query immediately before acting, so a previously returned rectangle is never trusted as the action target.
+
+`ui_type` first resolves and taps the field, then uses guest clipboard plus Cmd-V for Unicode-safe input by default; `method=keys` retains the ASCII key-event path. `ui_wait` polls semantic state rather than screenshots. Screenshots remain the visual verification/fallback layer when an application exposes poor accessibility metadata.
 
 Screenshots are returned as MCP image content. Large binary transfers use explicit host paths instead of embedding base64 in JSON. The host Unix socket is owner-only (`0600`). Keychain values are redacted unless `include_values=true` is requested explicitly.
-
-`accessibility_tree` is exposed but the current guest implementation is still a stub in `scripts/vphoned/vphoned_accessibility.m`; UI automation therefore uses app-level operations plus screenshot/coordinate control until that guest-side capability is implemented.
 
 ## M1 firmware patch fix
 

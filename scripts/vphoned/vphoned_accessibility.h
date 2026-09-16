@@ -1,12 +1,10 @@
 /*
- * vphoned_accessibility — Accessibility tree query over vsock.
+ * vphoned_accessibility — Semantic accessibility bridge.
  *
- * Handles accessibility_tree. Currently a stub — requires XPC research
- * to properly query the accessibility tree from a daemon context.
+ * Proxies length-prefixed JSON to VPhoneAX inside SpringBoard and performs
+ * resolved semantic taps through vphoned's existing HID injector.
  */
-
 #pragma once
 #import <Foundation/Foundation.h>
 
-/// Handle an accessibility_tree command. Returns a response dict.
 NSDictionary *vp_handle_accessibility_command(NSDictionary *msg);

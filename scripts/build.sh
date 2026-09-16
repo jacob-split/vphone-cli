@@ -84,6 +84,10 @@ if [[ "$BUILD_VPHONED" -eq 1 ]]; then
   echo "  signed → .build/vphoned.signed"
 fi
 
+# --- VPhoneAX semantic accessibility broker (SpringBoard tweak) ---
+echo "=== Building VPhoneAX semantic broker ==="
+make -C scripts/vphoneax
+
 # --- Bundle the standalone runtime mini-repo into Contents/Resources ---
 RES="${BUNDLE}/Contents/Resources"
 echo "=== Bundling runtime assets → ${RES} ==="

@@ -35,6 +35,7 @@ class VPhoneHostControl {
     private weak var cameraServer: VPhoneCameraServer?
     private weak var touchIDMonitor: VPhoneTouchIDMonitor?
     private weak var virtualMachine: VPhoneVirtualMachine?
+    private weak var keyHelper: VPhoneKeyHelper?
 
     /// Thread-safe box for passing results between main actor and accept queue.
     private final class ResultBox: @unchecked Sendable {
@@ -63,6 +64,7 @@ class VPhoneHostControl {
         cameraServer: VPhoneCameraServer?,
         touchIDMonitor: VPhoneTouchIDMonitor?,
         virtualMachine: VPhoneVirtualMachine,
+        keyHelper: VPhoneKeyHelper,
         screenWidth: Int,
         screenHeight: Int
     ) {
@@ -72,6 +74,7 @@ class VPhoneHostControl {
         self.cameraServer = cameraServer
         self.touchIDMonitor = touchIDMonitor
         self.virtualMachine = virtualMachine
+        self.keyHelper = keyHelper
         self.screenWidth = screenWidth
         self.screenHeight = screenHeight
 
@@ -572,6 +575,29 @@ class VPhoneHostControl {
             try await ctl.clipboardSet(text: string("text"))
             return ["set": true]
 
+        case "type_text":
+            let text = try string("text")
+            let method = json["method"] as? String ?? "paste"
+            switch method {
+            case "paste":
+                try await ctl.clipboardSet(text: text)
+                // Cmd-V through guest HID handles arbitrary Unicode from UIPasteboard.
+                ctl.sendHIDDown(page: 0x07, usage: 0xE3)
+                ctl.sendHIDPress(page: 0x07, usage: 0x19)
+                ctl.sendHIDUp(page: 0x07, usage: 0xE3)
+                try? await Task.sleep(for: .milliseconds(250))
+            case "keys":
+                guard let keyHelper else {
+                    throw VPhoneControl.ControlError.protocolError("keyboard helper unavailable")
+                }
+                keyHelper.typeString(text)
+                let settle = min(5.0, max(0.15, Double(text.count) * 0.025 + 0.1))
+                try? await Task.sleep(for: .seconds(settle))
+            default:
+                throw VPhoneControl.ControlError.protocolError("type_text method must be paste or keys")
+            }
+            return ["typed": true, "characters": text.count, "method": method]
+
         case "clipboard_set_image":
             let hostPath = try string("host_path")
             try await ctl.clipboardSet(imageData: Data(contentsOf: URL(fileURLWithPath: hostPath)))
@@ -627,8 +653,44 @@ class VPhoneHostControl {
             try await ctl.lowPowerMode(enabled: enabled)
             return ["enabled": enabled]
 
+        case "accessibility_status":
+            return try await ctl.accessibilityStatus()
+
+        case "accessibility_bootstrap":
+            return try await ctl.accessibilityBootstrap()
+
         case "accessibility_tree":
-            return try await ctl.accessibilityTree(depth: (json["depth"] as? NSNumber)?.intValue ?? -1)
+            return try await ctl.accessibilityTree(
+                mode: json["mode"] as? String ?? "compact",
+                maxDepth: (json["max_depth"] as? NSNumber)?.intValue ?? 20,
+                maxElements: (json["max_elements"] as? NSNumber)?.intValue ?? 500,
+                visibleOnly: json["visible_only"] as? Bool ?? true,
+                clickableOnly: json["clickable_only"] as? Bool ?? false
+            )
+
+        case "accessibility_find":
+            guard let selector = json["selector"] as? [String: Any] else {
+                throw VPhoneControl.ControlError.protocolError("accessibility_find requires selector")
+            }
+            return try await ctl.accessibilityFind(
+                selector: selector, deep: json["deep"] as? Bool ?? true,
+                maxDepth: (json["max_depth"] as? NSNumber)?.intValue ?? 20,
+                maxElements: (json["max_elements"] as? NSNumber)?.intValue ?? 1000
+            )
+
+        case "accessibility_hit_test":
+            return try await ctl.accessibilityHitTest(
+                x: try number("x"), y: try number("y")
+            )
+
+        case "accessibility_action":
+            guard let selector = json["selector"] as? [String: Any] else {
+                throw VPhoneControl.ControlError.protocolError("accessibility_action requires selector")
+            }
+            return try await ctl.accessibilityAction(
+                selector: selector, action: json["action"] as? String ?? "tap",
+                maxDepth: (json["max_depth"] as? NSNumber)?.intValue ?? 20
+            )
 
         case "location_set":
             try requireConnected()

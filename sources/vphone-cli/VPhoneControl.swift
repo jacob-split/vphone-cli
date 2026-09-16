@@ -692,14 +692,66 @@ class VPhoneControl {
         }
     }
 
-    // MARK: - Accessibility
+    // MARK: - Semantic Accessibility
 
-    func accessibilityTree(depth: Int = -1) async throws -> [String: Any] {
-        guard guestCaps.contains("accessibility_tree") else {
-            throw ControlError.unsupportedCapability("accessibility_tree")
+    private func semanticAccessibilityRequest(
+        _ type: String, payload: [String: Any] = [:]
+    ) async throws -> [String: Any] {
+        guard guestCaps.contains("accessibility_semantic") else {
+            throw ControlError.unsupportedCapability("accessibility_semantic")
         }
-        let (resp, _) = try await sendRequest(["t": "accessibility_tree", "depth": depth])
+        var req = payload
+        req["t"] = type
+        let (resp, _) = try await sendRequest(req)
         return resp
+    }
+
+    func accessibilityStatus() async throws -> [String: Any] {
+        try await semanticAccessibilityRequest("accessibility_status")
+    }
+
+    func accessibilityBootstrap() async throws -> [String: Any] {
+        try await semanticAccessibilityRequest("accessibility_bootstrap")
+    }
+
+    func accessibilityTree(
+        mode: String = "compact", maxDepth: Int = 20, maxElements: Int = 500,
+        visibleOnly: Bool = true, clickableOnly: Bool = false
+    ) async throws -> [String: Any] {
+        try await semanticAccessibilityRequest(
+            "accessibility_tree",
+            payload: [
+                "mode": mode, "max_depth": maxDepth, "max_elements": maxElements,
+                "visible_only": visibleOnly, "clickable_only": clickableOnly,
+            ]
+        )
+    }
+
+    func accessibilityFind(
+        selector: [String: Any], deep: Bool = true, maxDepth: Int = 20, maxElements: Int = 1000
+    ) async throws -> [String: Any] {
+        try await semanticAccessibilityRequest(
+            "accessibility_find",
+            payload: [
+                "selector": selector, "deep": deep, "max_depth": maxDepth,
+                "max_elements": maxElements,
+            ]
+        )
+    }
+
+    func accessibilityHitTest(x: Double, y: Double) async throws -> [String: Any] {
+        try await semanticAccessibilityRequest(
+            "accessibility_hit_test", payload: ["x": x, "y": y]
+        )
+    }
+
+    func accessibilityAction(
+        selector: [String: Any], action: String = "tap", maxDepth: Int = 20
+    ) async throws -> [String: Any] {
+        try await semanticAccessibilityRequest(
+            "accessibility_action",
+            payload: ["selector": selector, "action": action, "max_depth": maxDepth]
+        )
     }
 
     // MARK: - Location
@@ -963,7 +1015,7 @@ class VPhoneControl {
         guard hRead else { return nil }
 
         let length = Int(UInt32(bigEndian: header))
-        guard length > 0, length < 4 * 1024 * 1024 else { return nil }
+        guard length > 0, length <= 32 * 1024 * 1024 else { return nil }
 
         let payload = UnsafeMutablePointer<UInt8>.allocate(capacity: length)
         defer { payload.deallocate() }
