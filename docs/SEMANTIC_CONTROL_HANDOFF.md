@@ -6,9 +6,9 @@ Current base HEAD: `c57b036`
 
 ## Final state
 
-The `codex-semantic` JB virtual iPhone is operational as the canonical headless Codex/VPhone semantic-control target. The LaunchAgent `com.split.vphone.codex-semantic` is installed and running, and the worker reconnects across the guest's userspace boot/reboot transition without manual intervention.
+The `codex-semantic` JB virtual iPhone is operational as the canonical headless Codex/VPhone semantic-control target. It is configured for 2 vCPUs and 4096 MB RAM and is normally parked with no LaunchAgent or VM process running. Start it for a VPhone task with `scripts/install_semantic_worker.sh codex-semantic`, then stop and unregister it afterward with `scripts/uninstall_semantic_worker.sh codex-semantic`.
 
-The final end-to-end acceptance suite passed with `ok: true` in 54.224 seconds after the last semantic typing and reconnect fixes. `git diff --check` also passes.
+The latest right-sized cold-boot validation passed the complete end-to-end acceptance suite with `ok: true` in 55.45 seconds at 2 vCPUs and 4096 MB RAM. The 2 GB and 3 GB memory trials were rejected after readiness or semantic-navigation failures. `git diff --check` also passes.
 
 The active stack is:
 - host `.build/vphone-cli.app` and its owner-only `vphone.sock`;
@@ -54,13 +54,17 @@ The guest normally performs a userspace transition during JB boot. Do not treat 
 
 The host security prerequisites remain SIP disabled, Research Guests enabled, and `amfi_get_out_of_my_way=1 -v` in boot args. Preserve the active iOS tooling/runtime required by this project.
 
+The firmware IPSW cache is not required for normal VM boot or semantic operation and is intentionally empty. A rebuild, restore or VM recreation must download the required IPSWs again. Keep the active sparse `Disk.img` on local Mac storage while the VM is running; do not place the writable image on SSHFS or NFS.
+
 ## Resume / verification
 
 ```sh
 cd /Users/jacob/Developer/vphone-cli
 git switch codex/vphone-codex-integration
+scripts/install_semantic_worker.sh codex-semantic
 launchctl print gui/$(id -u)/com.split.vphone.codex-semantic
 .mcp-venv/bin/python scripts/test_semantic_vm.py codex-semantic
+scripts/uninstall_semantic_worker.sh codex-semantic
 git diff --check
 ```
 

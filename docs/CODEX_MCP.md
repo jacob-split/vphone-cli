@@ -6,6 +6,8 @@ This repository includes an owned MCP server under `integrations/vphone-mcp` so 
 
 On an 8 GB Apple Silicon Mac, the local defaults are 4 vCPUs and 4096 MB guest RAM. The virtual disk remains a sparse 64 GB file, so it grows as the guest writes data instead of reserving 64 GB immediately.
 
+The canonical `codex-semantic` worker is right-sized to 2 vCPUs and 4096 MB RAM. It is kept stopped between VPhone tasks; use `scripts/install_semantic_worker.sh codex-semantic` to start it and `scripts/uninstall_semantic_worker.sh codex-semantic` to park it afterward. Its IPSW cache is intentionally empty because normal boot does not require restore media.
+
 Codex VM creation defaults to the `jb` variant because semantic UI control requires the SpringBoard tweak-loading path. `jb` and `exp` install VPhoneAX automatically; `regular`, `dev`, and `less` do not currently provide the SpringBoard semantic broker.
 
 ## One-time host security gate
