@@ -145,7 +145,7 @@ class VPhoneHostControl {
 
     /// Capture current screen as a small grayscale JPEG, returned as base64.
     private func captureCompactScreenshot() async -> String? {
-        guard let recorder = screenRecorder, let view = captureView, view.window != nil else {
+        guard let recorder = screenRecorder, let view = captureView else {
             return nil
         }
 
@@ -271,8 +271,7 @@ class VPhoneHostControl {
                 defer { semaphore.signal() }
                 guard let controller,
                       let recorder = controller.screenRecorder,
-                      let view = controller.captureView,
-                      view.window != nil
+                      let view = controller.captureView
                 else {
                     result.error = "no active VM view"
                     return
@@ -307,7 +306,7 @@ class VPhoneHostControl {
 
             Task { @MainActor in
                 defer { semaphore.signal() }
-                guard let controller, let view = controller.captureView, view.window != nil else {
+                guard let controller, let view = controller.captureView else {
                     result.error = "no active VM view"
                     return
                 }
@@ -338,7 +337,7 @@ class VPhoneHostControl {
 
             Task { @MainActor in
                 defer { semaphore.signal() }
-                guard let controller, let view = controller.captureView, view.window != nil else {
+                guard let controller, let view = controller.captureView else {
                     result.error = "no active VM view"
                     return
                 }
@@ -653,11 +652,32 @@ class VPhoneHostControl {
             try await ctl.lowPowerMode(enabled: enabled)
             return ["enabled": enabled]
 
+        case "network_status":
+            return try await ctl.networkStatus()
+
+        case "audio_status":
+            return try await ctl.audioStatus()
+
+        case "audio_probe":
+            return try await ctl.audioProbe()
+
         case "accessibility_status":
             return try await ctl.accessibilityStatus()
 
         case "accessibility_bootstrap":
             return try await ctl.accessibilityBootstrap()
+
+        case "accessibility_device_state":
+            return try await ctl.accessibilityDeviceState()
+
+        case "accessibility_device_lock":
+            return try await ctl.semanticAccessibilityRaw(type: "accessibility_device_lock")
+
+        case "accessibility_device_unlock":
+            var payload: [String: Any] = [:]
+            if let strategy = json["strategy"] as? String { payload["strategy"] = strategy }
+            if let source = json["source"] as? NSNumber { payload["source"] = source }
+            return try await ctl.semanticAccessibilityRaw(type: "accessibility_device_unlock", payload: payload)
 
         case "accessibility_tree":
             return try await ctl.accessibilityTree(
@@ -688,56 +708,17 @@ class VPhoneHostControl {
                 throw VPhoneControl.ControlError.protocolError("accessibility_action requires selector")
             }
             let action = (json["action"] as? String ?? "tap").lowercased()
-            guard action == "tap" else {
+            guard action == "tap" || action == "type" else {
                 throw VPhoneControl.ControlError.protocolError(
                     "unsupported semantic action: \(action)"
                 )
             }
-
-            // Resolve the target through VPhoneAX immediately before acting, but
-            // inject the tap through the host VZ touchscreen. Guest-side IOKit
-            // digitizer injection is unnecessary on iOS 26+ and can destabilize
-            // SpringBoard on iOS 27.
-            let found = try await ctl.accessibilityFind(
-                selector: selector, deep: true,
-                maxDepth: (json["max_depth"] as? NSNumber)?.intValue ?? 20,
-                maxElements: 1000
+            return try await ctl.accessibilityAction(
+                selector: selector,
+                action: action,
+                text: json["text"] as? String,
+                maxDepth: (json["max_depth"] as? NSNumber)?.intValue ?? 20
             )
-            guard found["ok"] as? Bool == true else { return found }
-            guard let node = found["node"] as? [String: Any],
-                  let tap = node["tap"] as? [String: Any],
-                  let screen = found["screen"] as? [String: Any],
-                  let logicalX = (tap["x"] as? NSNumber)?.doubleValue,
-                  let logicalY = (tap["y"] as? NSNumber)?.doubleValue,
-                  let logicalWidth = (screen["width"] as? NSNumber)?.doubleValue,
-                  let logicalHeight = (screen["height"] as? NSNumber)?.doubleValue,
-                  logicalWidth > 0, logicalHeight > 0
-            else {
-                throw VPhoneControl.ControlError.protocolError(
-                    "semantic target has no actionable tap geometry"
-                )
-            }
-            guard let view = captureView, view.window != nil else {
-                throw VPhoneControl.ControlError.protocolError("no active VM view")
-            }
-
-            let pixelX = logicalX / logicalWidth * Double(screenWidth)
-            let pixelY = logicalY / logicalHeight * Double(screenHeight)
-            view.injectTap(
-                pixelX: pixelX, pixelY: pixelY,
-                screenWidth: screenWidth, screenHeight: screenHeight
-            )
-            // Ensure the synthesized mouse-up has been delivered before returning.
-            try? await Task.sleep(nanoseconds: 120_000_000)
-
-            var result = found
-            result["action"] = "tap"
-            result["tap_pixel"] = ["x": pixelX, "y": pixelY]
-            result["tap_normalized"] = [
-                "x": logicalX / logicalWidth, "y": logicalY / logicalHeight,
-            ]
-            result["injection"] = "host_vz_touchscreen"
-            return result
 
         case "location_set":
             try requireConnected()

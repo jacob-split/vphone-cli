@@ -34,6 +34,8 @@ typedef struct {
     AXUIElementCopyElementUsingContextIdAtPositionFunc copyElementUsingContextIdAtPosition;
     AXUIElementCopyElementUsingDisplayIdAtPositionFunc copyElementUsingDisplayIdAtPosition;
     AXUIElementGetPidFunc getPid;
+    AXUIElementCopyActionNamesFunc copyActionNames;
+    AXUIElementPerformActionFunc performAction;
     AXAddAssociatedPidFunc addAssociatedPid;
     AXIsPidAssociatedFunc isPidAssociated;
     AXIsPidAssociatedWithDisplayTypeFunc isPidAssociatedWithDisplayType;
@@ -339,6 +341,10 @@ static BOOL MCPAXBridgeLoadRuntime(NSString **error) {
                 (AXUIElementCopyElementUsingDisplayIdAtPositionFunc)dlsym(handle, "AXUIElementCopyElementUsingDisplayIdAtPosition");
             AXUIElementGetPidFunc getPid =
                 (AXUIElementGetPidFunc)dlsym(handle, "AXUIElementGetPid");
+            AXUIElementCopyActionNamesFunc copyActionNames =
+                (AXUIElementCopyActionNamesFunc)dlsym(handle, "AXUIElementCopyActionNames");
+            AXUIElementPerformActionFunc performAction =
+                (AXUIElementPerformActionFunc)dlsym(handle, "AXUIElementPerformAction");
             AXAddAssociatedPidFunc addAssociatedPid =
                 (AXAddAssociatedPidFunc)dlsym(handle, "_AXAddAssociatedPid");
             AXIsPidAssociatedFunc isPidAssociated =
@@ -408,6 +414,8 @@ static BOOL MCPAXBridgeLoadRuntime(NSString **error) {
             sMCPAXBridgeRuntime.copyElementUsingContextIdAtPosition = copyElementUsingContextIdAtPosition;
             sMCPAXBridgeRuntime.copyElementUsingDisplayIdAtPosition = copyElementUsingDisplayIdAtPosition;
             sMCPAXBridgeRuntime.getPid = getPid;
+            sMCPAXBridgeRuntime.copyActionNames = copyActionNames;
+            sMCPAXBridgeRuntime.performAction = performAction;
             sMCPAXBridgeRuntime.addAssociatedPid = addAssociatedPid;
             sMCPAXBridgeRuntime.isPidAssociated = isPidAssociated;
             sMCPAXBridgeRuntime.isPidAssociatedWithDisplayType = isPidAssociatedWithDisplayType;
@@ -1532,6 +1540,31 @@ static NSDictionary *MCPAXBridgeSnapshotValueSummary(id value) {
     return element;
 }
 
+- (NSArray<NSString *> *)copyActionNamesForElement:(AXUIElementRef)element {
+    if (!element || ![self ensureRuntimeAvailable:nil] || !sMCPAXBridgeRuntime.copyActionNames) return @[];
+    MCPAXBridgeSetRequestingClientForAutomation();
+    MCPAXBridgeApplyMessagingTimeout(element);
+    CFArrayRef names = NULL;
+    AXError err = sMCPAXBridgeRuntime.copyActionNames(element, &names);
+    if (err != kAXErrorSuccess || !names) return @[];
+    NSArray *raw = CFBridgingRelease(names);
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (id value in raw) {
+        if ([value isKindOfClass:[NSString class]] && [value length] > 0) [out addObject:value];
+    }
+    return out;
+}
+
+- (AXError)performAction:(CFStringRef)action onElement:(AXUIElementRef)element {
+    if (!element || !action) return kAXErrorIllegalArgument;
+    if (![self ensureRuntimeAvailable:nil] || !sMCPAXBridgeRuntime.performAction) {
+        return kAXErrorNotImplemented;
+    }
+    MCPAXBridgeSetRequestingClientForAutomation();
+    MCPAXBridgeApplyMessagingTimeout(element);
+    return sMCPAXBridgeRuntime.performAction(element, action);
+}
+
 - (BOOL)getPid:(pid_t *)pidOut fromElement:(AXUIElementRef)element {
     if (!element || !pidOut || !sMCPAXBridgeRuntime.getPid) return NO;
     pid_t resolvedPid = 0;
@@ -1549,6 +1582,7 @@ static NSDictionary *MCPAXBridgeSnapshotValueSummary(id value) {
         case kAXErrorInvalidUIElement: return @"invalid UI element";
         case kAXErrorCannotComplete: return @"cannot complete";
         case kAXErrorAttributeUnsupported: return @"attribute unsupported";
+        case kAXErrorActionUnsupported: return @"action unsupported";
         case kAXErrorNoValue: return @"no value";
         case kAXErrorNotImplemented: return @"not implemented";
         default: return [NSString stringWithFormat:@"error %d", (int)error];

@@ -1780,6 +1780,233 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
     return self;
 }
 
+- (NSDictionary * _Nullable)performPressForCompactNode:(NSDictionary *)targetNode
+                                                    pid:(pid_t)pid
+                                               bundleId:(NSString * _Nullable)bundleId
+                                              contextId:(uint32_t)contextId
+                                              displayId:(uint32_t)displayId
+                                                  error:(NSString * _Nullable * _Nullable)error {
+    __block NSDictionary *resultPayload = nil;
+    __block NSString *resultError = nil;
+
+    [self.attributeBridge performOnMainThreadSync:^{
+        @try {
+            if (![self.attributeBridge ensureRuntimeAvailable:&resultError]) return;
+            [self.attributeBridge ensureAssociationWithRemotePid:pid];
+
+            NSString *targetFingerprint = MCPAXNodeCompactElementFingerprint(targetNode);
+            if (targetFingerprint.length == 0) {
+                resultError = @"semantic target has no compact fingerprint";
+                return;
+            }
+
+            NSString *appError = nil;
+            AXUIElementRef appElement = [self.attributeBridge copyApplicationElementForPid:pid error:&appError];
+            if (!appElement) {
+                resultError = appError ?: [NSString stringWithFormat:@"AX create_application failed for PID %d", pid];
+                return;
+            }
+
+            CGRect screenBounds = MCPAXNodeScreenBounds();
+            __block NSUInteger examined = 0;
+            __block NSString *matchedSource = nil;
+            __block NSDictionary *matchedNode = nil;
+            __block AXError actionError = kAXErrorFailure;
+
+            void (^considerElement)(AXUIElementRef, NSString *) = ^(AXUIElementRef leafElement, NSString *source) {
+                if (!leafElement || resultPayload) return;
+                NSDictionary *compact = [self serializeCompactLeafElement:leafElement
+                                                                       pid:pid
+                                                                  bundleId:bundleId
+                                                              screenBounds:screenBounds
+                                                               visibleOnly:NO
+                                                             clickableOnly:NO];
+                if (![compact isKindOfClass:[NSDictionary class]]) return;
+                examined++;
+                NSString *fingerprint = MCPAXNodeCompactElementFingerprint(compact);
+                if (![fingerprint isEqualToString:targetFingerprint]) return;
+
+                matchedSource = source ?: @"compact_candidate";
+                matchedNode = compact;
+
+                // On iOS the private AXElement Objective-C wrapper is itself the
+                // automation action surface. Modern XCTest/rpc tooling invokes
+                // `-[AXElement press]`; AXUIElementPerformAction("AXPress") can
+                // return generic failure even for a valid, clickable row.
+                id leafObject = (__bridge id)leafElement;
+                SEL directPress = NSSelectorFromString(@"press");
+                if (leafObject && [leafObject respondsToSelector:directPress]) {
+                    @try {
+                        ((void (*)(id, SEL))objc_msgSend)(leafObject, directPress);
+                        resultPayload = @{
+                            @"ok": @YES,
+                            @"action": @"press",
+                            @"injection": @"ax_element_press",
+                            @"source": matchedSource,
+                            @"matched_node": matchedNode,
+                            @"wrapper_class": NSStringFromClass([leafObject class]) ?: @"",
+                            @"examined": @(examined)
+                        };
+                        return;
+                    } @catch (NSException *exception) {
+                        MCP_AX_NODE_LOG(@"direct AXElement press failed: %@: %@", exception.name, exception.reason);
+                    }
+                }
+
+                NSMutableArray *attempts = [NSMutableArray array];
+                id currentObject = leafObject;
+                AXError lastError = kAXErrorFailure;
+                for (NSInteger level = 0; level < 8 && currentObject; level++) {
+                    AXUIElementRef currentElement = (__bridge AXUIElementRef)currentObject;
+                    NSString *currentLabel = [self.attributeBridge copyStringAttribute:currentElement attribute:kAXLabelAttribute];
+                    id automationType = [self.attributeBridge copyXCAttributeObject:currentElement attributeKey:@"automationType"];
+                    NSArray<NSString *> *advertisedActions = [self.attributeBridge copyActionNamesForElement:currentElement];
+                    NSMutableArray<NSString *> *actions = [NSMutableArray array];
+                    if ([advertisedActions containsObject:@"AXPress"]) [actions addObject:@"AXPress"];
+                    for (NSString *actionName in advertisedActions) {
+                        if (![actions containsObject:actionName]) [actions addObject:actionName];
+                    }
+                    if (![actions containsObject:@"AXPress"]) [actions addObject:@"AXPress"];
+
+                    NSMutableArray *actionAttempts = [NSMutableArray array];
+                    NSString *successfulAction = nil;
+                    lastError = kAXErrorFailure;
+                    for (NSString *actionName in actions) {
+                        AXError actionResult = [self.attributeBridge performAction:(__bridge CFStringRef)actionName onElement:currentElement];
+                        [actionAttempts addObject:@{
+                            @"action": actionName,
+                            @"ax_error": @(actionResult),
+                            @"ax_error_text": [self.attributeBridge errorStringForAXError:actionResult]
+                        }];
+                        lastError = actionResult;
+                        if (actionResult == kAXErrorSuccess) {
+                            successfulAction = actionName;
+                            break;
+                        }
+                    }
+                    NSMutableDictionary *attempt = [@{
+                        @"level": @(level),
+                        @"ax_error": @(lastError),
+                        @"ax_error_text": [self.attributeBridge errorStringForAXError:lastError],
+                        @"available_actions": advertisedActions ?: @[],
+                        @"action_attempts": actionAttempts
+                    } mutableCopy];
+                    if (currentLabel.length > 0) attempt[@"label"] = currentLabel;
+                    if (automationType) attempt[@"automation_type"] = automationType;
+                    [attempts addObject:attempt];
+                    if (successfulAction) {
+                        actionError = kAXErrorSuccess;
+                        resultPayload = @{
+                            @"ok": @YES,
+                            @"action": successfulAction,
+                            @"injection": @"ax_action",
+                            @"ax_error": @(kAXErrorSuccess),
+                            @"source": matchedSource,
+                            @"matched_node": matchedNode,
+                            @"pressed_level": @(level),
+                            @"available_actions": advertisedActions ?: @[],
+                            @"attempts": attempts,
+                            @"examined": @(examined)
+                        };
+                        break;
+                    }
+
+                    id parent = [self.attributeBridge copyDirectAttributeObject:currentElement attributeKey:@"elementParent"];
+                    if (!parent) parent = [self.attributeBridge copyXCAttributeObject:currentElement attributeKey:@"parent"];
+                    if (!parent) parent = [self.attributeBridge copyDirectAttributeObject:currentElement attributeKey:@"remoteParent"];
+                    if (!parent || parent == currentObject) break;
+                    currentObject = parent;
+                }
+
+                if (!resultPayload) {
+                    actionError = lastError;
+                    resultPayload = @{
+                        @"ok": @NO,
+                        @"action": @"press",
+                        @"injection": @"ax_press",
+                        @"ax_error": @(lastError),
+                        @"source": matchedSource,
+                        @"matched_node": matchedNode,
+                        @"attempts": attempts,
+                        @"examined": @(examined)
+                    };
+                }
+            };
+
+            NSArray<NSDictionary<NSString *, id> *> *candidateSources = @[
+                @{@"source": @"visibleElements", @"attribute": @(kMCPAXNodeAttributeVisibleElements)},
+                @{@"source": @"semanticElements", @"attribute": @(kMCPAXNodeAttributeElementsWithSemanticContext)},
+                @{@"source": @"explorerElements", @"attribute": @(kMCPAXNodeAttributeExplorerElements)},
+                @{@"source": @"focusableElements", @"attribute": @(kMCPAXNodeAttributeNativeFocusableElements)},
+                @{@"source": @"siriFocusableElements", @"attribute": @(kMCPAXNodeAttributeSiriContentNativeFocusableElements)},
+                @{@"source": @"siriSemanticElements", @"attribute": @(kMCPAXNodeAttributeSiriContentElementsWithSemanticContext)}
+            ];
+
+            void (^scanCandidateGroups)(AXUIElementRef, NSString *) = ^(AXUIElementRef sourceElement, NSString *prefix) {
+                if (!sourceElement || resultPayload) return;
+                for (NSDictionary<NSString *, id> *sourceInfo in candidateSources) {
+                    if (resultPayload) break;
+                    NSNumber *attributeNumber = sourceInfo[@"attribute"];
+                    NSArray *leaves = [self.attributeBridge copyNumericAttributeArray:sourceElement
+                                                                          attributeId:(uint32_t)attributeNumber.unsignedIntValue];
+                    NSString *name = [NSString stringWithFormat:@"%@.%@", prefix ?: @"ax", sourceInfo[@"source"] ?: @"candidates"];
+                    for (id leaf in leaves) {
+                        if (resultPayload) break;
+                        if (!leaf || leaf == NSNull.null) continue;
+                        considerElement((__bridge AXUIElementRef)leaf, name);
+                    }
+                }
+            };
+
+            scanCandidateGroups(appElement, @"application");
+            if (!resultPayload) {
+                NSArray *windows = [self.attributeBridge copyNumericAttributeArray:appElement
+                                                                       attributeId:kMCPAXNodeAttributeChildren];
+                for (id window in windows) {
+                    if (resultPayload) break;
+                    if (!window || window == NSNull.null) continue;
+                    scanCandidateGroups((__bridge AXUIElementRef)window, @"window");
+                }
+            }
+
+            // Preserve the sampled-hit fallback used by compact semantic discovery.
+            if (!resultPayload) {
+                for (NSValue *pointValue in MCPAXNodeCompactScreenProbePoints(screenBounds)) {
+                    if (resultPayload) break;
+                    NSString *hitError = nil;
+                    AXUIElementRef hitElement = [self.attributeBridge copyHitTestElementAtPoint:pointValue.CGPointValue
+                                                                                    expectedPid:pid
+                                                                             allowParameterized:YES
+                                                                                          error:&hitError];
+                    if (!hitElement) continue;
+                    considerElement(hitElement, @"sampled.hitTest");
+                    CFRelease(hitElement);
+                }
+            }
+
+            CFRelease(appElement);
+            if (!resultPayload) {
+                resultError = [NSString stringWithFormat:@"AXPress target was not re-resolved (examined=%lu)",
+                               (unsigned long)examined];
+            } else if (actionError != kAXErrorSuccess) {
+                resultError = [NSString stringWithFormat:@"AXPress failed: %@",
+                               [self.attributeBridge errorStringForAXError:actionError]];
+            }
+            (void)contextId;
+            (void)displayId;
+        } @catch (NSException *exception) {
+            resultError = [NSString stringWithFormat:@"AXPress exception: %@: %@",
+                           exception.name, exception.reason ?: @"<no reason>"];
+        }
+    }];
+
+    if ((!resultPayload || ![resultPayload[@"ok"] boolValue]) && error) {
+        *error = resultError ?: @"AXPress failed";
+    }
+    return resultPayload;
+}
+
+
 - (NSDictionary * _Nullable)elementAtPoint:(CGPoint)point
                                        pid:(pid_t)pid
                                   contextId:(uint32_t)contextId
@@ -2425,10 +2652,13 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
     BOOL hasScreenCenterPoint =
         MCPAXNodeCGPointFromObject(directValues[@"centerPoint"], &centerPoint) &&
         CGRectContainsPoint(screenBounds, centerPoint);
-    // iOS 27 frequently reports compact candidate frames in window-local
-    // coordinates while AXElement.centerPoint is already display/screen space.
-    // Use the latter for interaction even when it falls outside the local rect.
-    if (hasScreenCenterPoint) {
+    // Prefer AX's reported activation/center point only when it is consistent
+    // with the visible geometry. iOS 27 can return a screen-space center that
+    // belongs to a stale scrolled position; tapping it may hit a different row.
+    // The clipped visible rect is authoritative when the AX point lies outside it.
+    BOOL centerInsideVisibleRect = hasScreenCenterPoint && onScreen &&
+        CGRectContainsPoint(CGRectInset(visibleRect, -1.0, -1.0), centerPoint);
+    if (centerInsideVisibleRect) {
         tapPoint = centerPoint;
     }
 

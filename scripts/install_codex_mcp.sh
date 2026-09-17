@@ -34,7 +34,7 @@ text = config.read_text()
 data = tomllib.loads(text or "")
 if "vphone" not in data.get("mcp_servers", {}):
     binary = repo / ".build/vphone-cli.app/Contents/MacOS/vphone-cli"
-    block = f'''\n\n[mcp_servers.vphone]\ncommand = "{wrapper}"\ncwd = "{repo}"\nrequired = false\nstartup_timeout_sec = 30.0\ntool_timeout_sec = 5400.0\ndefault_tools_approval_mode = "approve"\n\n[mcp_servers.vphone.env]\nVPHONE_REPO = "{repo}"\nVPHONE_BIN = "{binary}"\n\n[mcp_servers.vphone.tools.accessibility_tree]\noutput_token_limit = 12000\n\n[mcp_servers.vphone.tools.keychain_list]\noutput_token_limit = 8000\n\n[mcp_servers.vphone.tools.guest_request]\noutput_token_limit = 8000\n'''
+    block = f'''\n\n[mcp_servers.vphone]\ncommand = "{wrapper}"\ncwd = "{repo}"\nrequired = false\nstartup_timeout_sec = 30.0\ntool_timeout_sec = 5400.0\ndefault_tools_approval_mode = "approve"\n\n[mcp_servers.vphone.env]\nVPHONE_REPO = "{repo}"\nVPHONE_BIN = "{binary}"\nVPHONE_DEFAULT_VM = "codex-semantic"\n\n[mcp_servers.vphone.tools.accessibility_tree]\noutput_token_limit = 12000\n\n[mcp_servers.vphone.tools.keychain_list]\noutput_token_limit = 8000\n\n[mcp_servers.vphone.tools.guest_request]\noutput_token_limit = 8000\n'''
     text = text.rstrip() + block + "\n"
     tomllib.loads(text)
     config.write_text(text)

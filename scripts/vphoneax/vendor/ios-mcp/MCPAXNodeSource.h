@@ -33,6 +33,13 @@ NS_ASSUME_NONNULL_BEGIN
                                     clickableOnly:(BOOL)clickableOnly
                                             error:(NSString * _Nullable * _Nullable)error;
 
+- (NSDictionary * _Nullable)performPressForCompactNode:(NSDictionary *)targetNode
+                                                    pid:(pid_t)pid
+                                               bundleId:(NSString * _Nullable)bundleId
+                                              contextId:(uint32_t)contextId
+                                              displayId:(uint32_t)displayId
+                                                  error:(NSString * _Nullable * _Nullable)error;
+
 @end
 
 NS_ASSUME_NONNULL_END

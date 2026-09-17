@@ -20,12 +20,14 @@
 #include <mach-o/dyld.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #import "vphoned_accessibility.h"
 #import "vphoned_apps.h"
+#import "vphoned_audio.h"
 #import "vphoned_clipboard.h"
 #import "vphoned_devmode.h"
 #import "vphoned_files.h"
@@ -104,6 +106,27 @@ static const char *self_executable_path(void) {
 
 /// Returns the first non-loopback IPv4 address, preferring en* interfaces
 /// (Wi-Fi/cellular over virtual). Returns nil if no usable address is found.
+static NSArray *network_interfaces(void) {
+  struct ifaddrs *ifap = NULL;
+  if (getifaddrs(&ifap) != 0 || ifap == NULL) return @[];
+  NSMutableArray *items = [NSMutableArray array];
+  for (struct ifaddrs *cur = ifap; cur != NULL; cur = cur->ifa_next) {
+    if (!cur->ifa_addr || cur->ifa_addr->sa_family != AF_INET) continue;
+    if ((cur->ifa_flags & IFF_UP) == 0 || (cur->ifa_flags & IFF_LOOPBACK)) continue;
+    char buf[INET_ADDRSTRLEN] = {0};
+    struct sockaddr_in *sin = (struct sockaddr_in *)cur->ifa_addr;
+    if (!inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) continue;
+    NSString *name = [NSString stringWithUTF8String:cur->ifa_name ?: ""];
+    NSString *addr = [NSString stringWithUTF8String:buf];
+    [items addObject:@{
+      @"name": name ?: @"", @"ipv4": addr ?: @"",
+      @"up": @YES, @"point_to_point": @((cur->ifa_flags & IFF_POINTOPOINT) != 0)
+    }];
+  }
+  freeifaddrs(ifap);
+  return items;
+}
+
 static NSString *primary_ipv4_address(void) {
   struct ifaddrs *ifap = NULL;
   if (getifaddrs(&ifap) != 0 || ifap == NULL)
@@ -259,6 +282,13 @@ static NSDictionary *handle_command(NSDictionary *msg) {
     return vp_make_response(@"pong", reqId);
   }
 
+  if ([type isEqualToString:@"network_status"]) {
+    NSMutableDictionary *r = vp_make_response(@"network", reqId);
+    r[@"primary_ipv4"] = primary_ipv4_address() ?: [NSNull null];
+    r[@"interfaces"] = network_interfaces();
+    return r;
+  }
+
   if ([type isEqualToString:@"location"]) {
     if (!vp_location_available() && !vp_location_load()) {
       NSMutableDictionary *r = vp_make_response(@"err", reqId);
@@ -303,13 +333,26 @@ static NSDictionary *handle_command(NSDictionary *msg) {
 
 // MARK: - Client Session
 
+static void vp_set_socket_timeout(int fd, int seconds) {
+  struct timeval timeout = {.tv_sec = seconds, .tv_usec = 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+static void vp_clear_receive_timeout(int fd) {
+  struct timeval timeout = {.tv_sec = 0, .tv_usec = 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+}
+
 /// Returns YES if daemon should exit for restart (after update).
 static BOOL handle_client(int fd) {
   BOOL should_restart = NO;
   @autoreleasepool {
-    dprintf(STDERR_FILENO, "[vphoned-handshake] accepted fd=%d\n", fd);
+    // A VZ vsock can be accepted during early boot and then never deliver a
+    // complete hello. vphoned handles clients serially, so bound only the
+    // handshake read; otherwise one half-open fd can block every later retry.
+    vp_set_socket_timeout(fd, 10);
     NSDictionary *hello = vp_read_message(fd);
-    dprintf(STDERR_FILENO, "[vphoned-handshake] read hello=%s\n", hello ? "yes" : "no");
     if (!hello) {
       close(fd);
       return NO;
@@ -339,7 +382,6 @@ static BOOL handle_client(int fd) {
 
     // Hash comparison for auto-update. This is local file I/O only; all
     // network/OS metadata is deliberately excluded from the boot handshake.
-    dprintf(STDERR_FILENO, "[vphoned-handshake] validating version/hash\n");
     NSString *hostHash = hello[@"bin_hash"];
     BOOL needUpdate = NO;
     if (hostHash.length > 0) {
@@ -353,7 +395,6 @@ static BOOL handle_client(int fd) {
       }
     }
 
-    dprintf(STDERR_FILENO, "[vphoned-handshake] hash complete needUpdate=%d\n", needUpdate);
 
     // Advertise the intended control surface without probing private frameworks
     // during handshake. Each optional subsystem initializes lazily on first use,
@@ -361,7 +402,7 @@ static BOOL handle_client(int fd) {
     NSMutableArray *caps = [NSMutableArray arrayWithObjects:
         @"hid", @"touch", @"devmode", @"location", @"file", @"keychain",
         @"ipa_install", @"clipboard", @"apps", @"url", @"settings",
-        @"accessibility_semantic", nil];
+        @"network", @"audio", @"accessibility_semantic", nil];
 
     NSMutableDictionary *helloResp = [@{
       @"v" : @PROTOCOL_VERSION,
@@ -374,12 +415,15 @@ static BOOL handle_client(int fd) {
     if (needUpdate)
       helloResp[@"need_update"] = @YES;
 
-    dprintf(STDERR_FILENO, "[vphoned-handshake] sending hello\n");
     if (!vp_write_message(fd, helloResp)) {
       close(fd);
       return NO;
     }
-    dprintf(STDERR_FILENO, "[vphoned-handshake] hello sent\n");
+    // Keep a bounded idle receive timeout after handshake. The host sends a
+    // heartbeat every 5 seconds, so a healthy session stays alive. If VZ leaves
+    // an accepted vsock stale across a guest userspace transition, this releases
+    // the serial client loop instead of blocking accept() forever.
+    vp_set_socket_timeout(fd, 20);
     NSLog(@"vphoned: client connected (v%d)%s", PROTOCOL_VERSION,
           needUpdate ? " [update pending]" : "");
 
@@ -428,6 +472,14 @@ static BOOL handle_client(int fd) {
           NSDictionary *resp = vp_handle_clipboard_command(fd, msg);
           if (resp && !vp_write_message(fd, resp))
             break;
+          continue;
+        }
+
+        // Passive audio route/status inspection. Never activates the audio
+        // session, so it cannot steal microphone/speaker ownership from apps.
+        if ([t hasPrefix:@"audio_"]) {
+          NSDictionary *resp = vp_handle_audio_command(msg);
+          if (resp && !vp_write_message(fd, resp)) break;
           continue;
         }
 
@@ -487,6 +539,9 @@ static BOOL handle_client(int fd) {
 // MARK: - Main
 
 int main(int argc, char *argv[]) {
+  // Control peers may disappear during host/VM reconnects. A failed socket
+  // write must unwind the client session, not terminate the daemon with SIGPIPE.
+  signal(SIGPIPE, SIG_IGN);
   @autoreleasepool {
     // Bootstrap: if running from install path and a cached update exists, exec
     // it

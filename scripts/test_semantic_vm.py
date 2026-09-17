@@ -64,9 +64,9 @@ def ensure_settings_root(vm: str) -> None:
             pass
 
         if not nudged_unlock:
-            vp.press_key("home", vm)
-            time.sleep(0.4)
-            vp.swipe(215, 860, 215, 250, 450, vm)
+            unlocked = vp.device_unlock(vm)
+            if not unlocked.get("ok"):
+                raise AssertionError(f"worker could not unlock semantically: {unlocked}")
             nudged_unlock = True
         time.sleep(1)
     else:

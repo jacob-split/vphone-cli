@@ -6,6 +6,9 @@ import Virtualization
 class VPhoneVirtualMachineView: VZVirtualMachineView {
     var keyHelper: VPhoneKeyHelper?
     weak var control: VPhoneControl?
+    /// True for the persistent Codex worker's off-screen, window-backed VZ view.
+    /// Input bypasses NSEvent and goes directly to the native VZ multitouch device.
+    var headlessAutomation = false
 
     private var currentTouchSwipeAim: Int = 0
     private var isDragHighlightVisible = false
@@ -194,8 +197,23 @@ class VPhoneVirtualMachineView: VZVirtualMachineView {
     /// Inject a tap at pixel coordinates (matching screenshot image dimensions).
     func injectTap(pixelX: Double, pixelY: Double, screenWidth: Int, screenHeight: Int) {
         let localPoint = pixelToLocal(pixelX: pixelX, pixelY: pixelY, screenWidth: screenWidth, screenHeight: screenHeight)
-        let windowPoint = convert(localPoint, to: nil)
 
+        // Headless workers deliberately have no NSWindow. Send the same native
+        // VZ multitouch events directly instead of synthesizing NSEvents.
+        if headlessAutomation || window == nil {
+            let now = ProcessInfo.processInfo.systemUptime
+            _ = sendTouchEvent(phase: 0, localPoint: localPoint, timestamp: now)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+                guard let self else { return }
+                _ = self.sendTouchEvent(
+                    phase: 3, localPoint: localPoint,
+                    timestamp: ProcessInfo.processInfo.systemUptime
+                )
+            }
+            return
+        }
+
+        let windowPoint = convert(localPoint, to: nil)
         if let downEvent = synthesizeMouseEvent(type: .leftMouseDown, at: windowPoint) {
             mouseDown(with: downEvent)
         }
@@ -214,11 +232,32 @@ class VPhoneVirtualMachineView: VZVirtualMachineView {
     ) {
         let startLocal = pixelToLocal(pixelX: fromX, pixelY: fromY, screenWidth: screenWidth, screenHeight: screenHeight)
         let endLocal = pixelToLocal(pixelX: toX, pixelY: toY, screenWidth: screenWidth, screenHeight: screenHeight)
-        let startWindow = convert(startLocal, to: nil)
-        let endWindow = convert(endLocal, to: nil)
-
         let steps = max(10, durationMs / 16)
         let stepInterval = Double(durationMs) / Double(steps) / 1000.0
+
+        if headlessAutomation || window == nil {
+            let now = ProcessInfo.processInfo.systemUptime
+            _ = sendTouchEvent(phase: 0, localPoint: startLocal, timestamp: now)
+            for i in 1...steps {
+                let t = Double(i) / Double(steps)
+                let point = NSPoint(
+                    x: startLocal.x + (endLocal.x - startLocal.x) * t,
+                    y: startLocal.y + (endLocal.y - startLocal.y) * t
+                )
+                let phase = i < steps ? 1 : 3
+                DispatchQueue.main.asyncAfter(deadline: .now() + stepInterval * Double(i)) { [weak self] in
+                    guard let self else { return }
+                    _ = self.sendTouchEvent(
+                        phase: phase, localPoint: point,
+                        timestamp: ProcessInfo.processInfo.systemUptime
+                    )
+                }
+            }
+            return
+        }
+
+        let startWindow = convert(startLocal, to: nil)
+        let endWindow = convert(endLocal, to: nil)
 
         if let downEvent = synthesizeMouseEvent(type: .leftMouseDown, at: startWindow) {
             mouseDown(with: downEvent)
@@ -259,27 +298,27 @@ class VPhoneVirtualMachineView: VZVirtualMachineView {
         // the 26.x kernel, so route touches through vphoned's guest-side HID
         // injection. 26.x bases fall through to the native VZ multitouch path.
         if let control, control.useGuestTouchInjection {
+            // vphoned dispatches through the global IOHIDEventSystemClient path,
+            // whose display-integrated digitizer coordinates are normalized.
             control.sendTouch(phase: phase, x: Double(normalizedPoint.x), y: Double(normalizedPoint.y))
             return true
         }
 
-        guard let device = multiTouchDevice,
-              virtualMachine != nil
-        else { return false }
+        guard let device = multiTouchDevice else { return false }
 
-        let touch = Dynamic._VZTouch(
-            view: self,
-            index: 0,
-            phase: phase,
-            location: normalizedPoint,
-            swipeAim: currentTouchSwipeAim,
-            timestamp: timestamp
-        )
-
-        guard let touchObj = touch.asObject else {
-            print("[vphone] Error: Failed to create _VZTouch")
+        // Match the working VirtualizationPrivate bridge exactly. The private
+        // initWithView: initializer is not stable across host releases; allocate
+        // _VZTouch with plain init and populate its backing fields via KVC.
+        guard let touchClass = NSClassFromString("_VZTouch") as? NSObject.Type else {
+            print("[vphone] Error: _VZTouch class unavailable")
             return false
         }
+        let touchObj = touchClass.init()
+        touchObj.setValue(NSNumber(value: UInt8(0)), forKey: "_index")
+        touchObj.setValue(NSNumber(value: phase), forKey: "_phase")
+        touchObj.setValue(NSNumber(value: currentTouchSwipeAim), forKey: "_swipeAim")
+        touchObj.setValue(NSNumber(value: timestamp), forKey: "_timestamp")
+        touchObj.setValue(NSValue(point: normalizedPoint), forKey: "_location")
 
         let touchEvent = Dynamic._VZMultiTouchEvent(touches: [touchObj])
         guard let eventObj = touchEvent.asObject else { return false }

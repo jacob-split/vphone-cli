@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import plistlib
 import shutil
 import socket
 import subprocess
@@ -437,6 +438,48 @@ def low_power_mode(enabled: bool, vm: str | None = None) -> dict[str, Any]:
 
 
 @server.tool()
+def network_status(vm: str | None = None) -> dict[str, Any]:
+    """Return guest interfaces/IPs plus the VM's configured host network mode."""
+    guest = _rpc("network_status", vm=vm)
+    requested = vm or DEFAULT_VM
+    configured: dict[str, Any] | None = None
+    if requested:
+        config_path = VM_ROOT / requested / "config.plist"
+        if config_path.exists():
+            try:
+                with config_path.open("rb") as f:
+                    manifest = plistlib.load(f)
+                configured = manifest.get("networkConfig")
+            except Exception:
+                configured = None
+    return {"guest": guest, "configured": configured}
+
+
+@server.tool()
+def audio_status(vm: str | None = None) -> dict[str, Any]:
+    """Return iOS AVAudioSession input/output routes without activating or changing audio."""
+    result = _rpc("audio_status", vm=vm)
+    result["host_bridge"] = {
+        "virtio_sound": True,
+        "input_source": "VZHostAudioInputStreamSource",
+        "output_sink": "VZHostAudioOutputStreamSink",
+    }
+    return result
+
+
+@server.tool()
+def audio_probe(vm: str | None = None) -> dict[str, Any]:
+    """Briefly activate PlayAndRecord to verify guest microphone/speaker routes, then deactivate and restore the session."""
+    result = _rpc("audio_probe", vm=vm)
+    result["host_bridge"] = {
+        "virtio_sound": True,
+        "input_source": "VZHostAudioInputStreamSource",
+        "output_sink": "VZHostAudioOutputStreamSink",
+    }
+    return result
+
+
+@server.tool()
 def location_set(
     latitude: float,
     longitude: float,
@@ -493,6 +536,165 @@ def _ui_selector(
     if not any(k in selector for k in ("identifier", "label", "role", "value")):
         raise ValueError("semantic selector requires identifier, label, role, or value")
     return selector
+
+
+def _semantic_lock_state(vm: str | None = None) -> dict[str, Any]:
+    """Infer lock state from AX semantics only; never uses screenshots."""
+    tree = ui_tree(vm=vm, mode="compact", max_elements=80, visible_only=True)
+    context = tree.get("frontmost_context", {})
+    bundle = context.get("bundleId") or tree.get("bundleId")
+    elements = tree.get("elements") or []
+    texts = [str(e.get("text") or "") for e in elements if isinstance(e, dict)]
+    home_labels = {
+        "Settings", "Phone", "Safari", "Messages", "Mail", "Photos",
+        "Calendar", "Clock", "Maps", "Music", "App Store", "Notes",
+    }
+    home_matches = sorted(home_labels.intersection(texts))
+    lock_markers = [t for t in texts if t and (":" in t or "battery power" in t.lower())]
+    # Foreground app other than SpringBoard is necessarily past the lock screen.
+    if bundle and bundle != "com.apple.springboard":
+        locked: bool | None = False
+    elif home_matches:
+        locked = False
+    elif bundle == "com.apple.springboard" and len(elements) <= 8 and lock_markers:
+        locked = True
+    else:
+        locked = None
+    return {
+        "screen_locked": locked, "source": "semantic_tree",
+        "bundle_id": bundle, "home_labels": home_matches,
+        "lock_markers": lock_markers[:8], "screen": tree.get("screen") or {},
+    }
+
+
+@server.tool()
+def device_state(vm: str | None = None) -> dict[str, Any]:
+    """Return authoritative SpringBoard lock state plus foreground/semantic context."""
+    direct_error: str | None = None
+    direct: dict[str, Any] | None = None
+    try:
+        direct = _rpc("accessibility_device_state", vm=vm)
+        if direct.get("ok") is True and isinstance(direct.get("screen_locked"), bool):
+            direct["source"] = "springboard_lock_manager"
+            try:
+                direct["foreground"] = app_foreground(vm)
+            except Exception:
+                pass
+            return direct
+        if direct.get("ok") is not True:
+            direct_error = str(direct.get("error") or direct.get("msg") or "direct state unavailable")
+    except Exception as exc:
+        direct_error = str(exc)
+    fallback = _semantic_lock_state(vm)
+    if direct_error:
+        fallback["direct_error"] = direct_error
+    if isinstance(direct, dict):
+        hint = direct.get("screen_locked_hint")
+        if hint is not None:
+            fallback["direct_lock_hint"] = hint
+        if "control_center_visible" in direct:
+            fallback["control_center_visible"] = direct["control_center_visible"]
+    try:
+        fallback["foreground"] = app_foreground(vm)
+    except Exception:
+        pass
+    return fallback
+
+
+def _vm_screen_pixels(vm: str | None) -> tuple[float, float]:
+    requested = vm or DEFAULT_VM
+    if not requested:
+        # vphone's canonical default display; only used when no named VM is configured.
+        return 1290.0, 2796.0
+    config_path = VM_ROOT / requested / "config.plist"
+    with config_path.open("rb") as f:
+        manifest = plistlib.load(f)
+    screen = manifest.get("screenConfig", {})
+    return float(screen.get("width", 1290)), float(screen.get("height", 2796))
+
+
+@server.tool()
+def device_home(vm: str | None = None) -> dict[str, Any]:
+    """Press Home without capturing a screenshot."""
+    return _control({"t": "key", "name": "home", "screen": False}, vm=vm)
+
+
+@server.tool()
+def device_lock(vm: str | None = None) -> dict[str, Any]:
+    """Lock the worker with the hardware power-key path and verify semantically."""
+    before = device_state(vm)
+    if before.get("screen_locked") is True:
+        return {"ok": True, "changed": False, "state": before}
+    _control({"t": "key", "name": "power", "screen": False}, vm=vm)
+    deadline = time.monotonic() + 3.0
+    last = before
+    while time.monotonic() < deadline:
+        time.sleep(0.15)
+        last = device_state(vm)
+        if last.get("screen_locked") is True:
+            return {"ok": True, "changed": True, "state": last}
+    return {"ok": False, "error": "lock_state_did_not_change", "state": last}
+
+
+@server.tool()
+def device_unlock(vm: str | None = None) -> dict[str, Any]:
+    """Unlock an authenticated no-passcode worker and verify with SpringBoard's lock bit."""
+    before = device_state(vm)
+
+    # Always give SpringBoard's broker a chance to normalize Cover Sheet and
+    # interactive display state. A cold-boot worker can have isUILocked=false
+    # while SpringBoard still owns the visible/noninteractive surface.
+
+    # Prefer SpringBoard's authenticated cover-sheet transition. This avoids the
+    # unstable direct SBLockScreenManager unlock selectors while still following
+    # the same UI controller path as a normal authenticated dismissal.
+    try:
+        direct = _rpc(
+            "accessibility_device_unlock", vm=vm,
+            strategy="start_finish", source=0,
+        )
+        if direct.get("ok") is True:
+            deadline = time.monotonic() + 3.0
+            last = before
+            while time.monotonic() < deadline:
+                time.sleep(0.15)
+                last = device_state(vm)
+                if last.get("screen_locked") is False:
+                    return {
+                        "ok": True, "changed": bool(direct.get("changed", before.get("screen_locked") is True)),
+                        "method": "cover_sheet", "direct": direct, "state": last,
+                    }
+    except Exception:
+        direct = None
+
+    # Hardware-compatible fallback: wake and perform the normal swipe-up gesture
+    # through the guest HID injector, then verify against SpringBoard itself.
+    _control({"t": "key", "name": "home", "screen": False}, vm=vm)
+    time.sleep(0.35)
+    state = device_state(vm)
+    screen = state.get("screen") or {}
+    width = float(screen.get("pixel_width") or 0)
+    height = float(screen.get("pixel_height") or 0)
+    if width <= 0 or height <= 0:
+        width, height = _vm_screen_pixels(vm)
+    _control(
+        {
+            "t": "swipe", "x1": width * 0.50, "y1": height * 0.92,
+            "x2": width * 0.50, "y2": height * 0.08, "ms": 260, "screen": False,
+        },
+        vm=vm,
+    )
+    deadline = time.monotonic() + 6.0
+    last = state
+    while time.monotonic() < deadline:
+        time.sleep(0.25)
+        last = device_state(vm)
+        if last.get("screen_locked") is False:
+            return {"ok": True, "changed": True, "method": "swipe", "state": last}
+    return {
+        "ok": False, "error": "still_locked",
+        "requires_authentication": True, "direct": direct, "state": last,
+    }
 
 
 @server.tool()
@@ -596,12 +798,25 @@ def ui_type(
     if method not in {"paste", "keys"}:
         raise ValueError("method must be paste or keys")
     selector = _ui_selector(identifier, label, role, value, contains, index, visible, True)
-    action = _rpc(
-        "accessibility_action", vm=vm, selector=selector, action="tap", max_depth=max_depth,
+    semantic_type = _rpc(
+        "accessibility_action", vm=vm, selector=selector, action="type", text=text, max_depth=max_depth,
     )
-    if not action.get("ok"):
-        return {"ok": False, "stage": "resolve_and_tap", "action": action}
-    typed = _rpc("type_text", vm=vm, text=text, method=method)
+    if semantic_type.get("ok"):
+        action = semantic_type
+        typed = {
+            "typed": True, "characters": len(text), "method": "ax_element",
+            "injection": semantic_type.get("injection"),
+        }
+    else:
+        action = _rpc(
+            "accessibility_action", vm=vm, selector=selector, action="tap", max_depth=max_depth,
+        )
+        if not action.get("ok"):
+            return {
+                "ok": False, "stage": "resolve_and_type",
+                "semantic_type": semantic_type, "action": action,
+            }
+        typed = _rpc("type_text", vm=vm, text=text, method=method)
     result: dict[str, Any] = {"ok": True, "action": action, "typed": typed}
     if verify:
         time.sleep(0.25)

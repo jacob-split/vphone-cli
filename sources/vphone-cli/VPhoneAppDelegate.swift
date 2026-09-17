@@ -14,6 +14,11 @@ class VPhoneAppDelegate: NSObject, NSApplicationDelegate {
     private var locationProvider: VPhoneLocationProvider?
     private var hostControl: VPhoneHostControl?
     private var cameraServer: VPhoneCameraServer?
+    // Retained only in headless mode. VPhoneHostControl keeps weak references
+    // so the hidden VZ view and key helper must live for the VM lifetime.
+    private var headlessControlView: VPhoneVirtualMachineView?
+    private var headlessControlWindow: NSWindow?
+    private var headlessKeyHelper: VPhoneKeyHelper?
     private var sigintSource: DispatchSourceSignal?
     private var didAttemptAutoInstall = false
 
@@ -204,13 +209,67 @@ class VPhoneAppDelegate: NSObject, NSApplicationDelegate {
                 mc?.updateLocationCapability(available: false)
             }
         } else if !cli.dfu {
-            // Headless mode: auto-start location as before (no menu exists)
-            control.onConnect = { [weak provider = locationProvider] caps in
-                if caps.contains("location") {
-                    provider?.startForwarding()
-                } else {
-                    print("[location] guest does not support location simulation")
-                }
+            // Headless worker mode owns a VZVirtualMachineView attached to a
+            // nonactivating off-screen window. Virtualization's native multitouch
+            // path needs a window-backed view on iOS 27, but the worker must never
+            // expose an onscreen phone surface or steal focus from the user.
+            let keyHelper = VPhoneKeyHelper(vm: vm, control: control)
+            headlessKeyHelper = keyHelper
+
+            let hiddenView = VPhoneVirtualMachineView(
+                frame: NSRect(
+                    x: 0, y: 0,
+                    width: CGFloat(options.screenWidth) / CGFloat(options.screenScale),
+                    height: CGFloat(options.screenHeight) / CGFloat(options.screenScale)
+                )
+            )
+            hiddenView.virtualMachine = vm.virtualMachine
+            hiddenView.capturesSystemKeys = true
+            hiddenView.keyHelper = keyHelper
+            hiddenView.control = control
+            hiddenView.headlessAutomation = true
+            headlessControlView = hiddenView
+
+            let offscreenWindow = NSWindow(
+                contentRect: hiddenView.frame,
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
+            )
+            offscreenWindow.isReleasedWhenClosed = false
+            offscreenWindow.ignoresMouseEvents = true
+            offscreenWindow.isOpaque = false
+            offscreenWindow.backgroundColor = .clear
+            offscreenWindow.alphaValue = 0.01
+            offscreenWindow.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+            offscreenWindow.setFrameOrigin(NSPoint(x: -20_000, y: -20_000))
+            offscreenWindow.contentView = hiddenView
+            offscreenWindow.orderFront(nil)
+            headlessControlWindow = offscreenWindow
+
+            let recorder = VPhoneScreenRecorder()
+            let socketPath = options.configURL
+                .deletingLastPathComponent()
+                .appendingPathComponent("vphone.sock").path
+            let hc = VPhoneHostControl(socketPath: socketPath)
+            hc.start(
+                captureView: hiddenView,
+                screenRecorder: recorder,
+                control: control,
+                cameraServer: cameraServer,
+                touchIDMonitor: nil,
+                virtualMachine: vm,
+                keyHelper: keyHelper,
+                screenWidth: options.screenWidth,
+                screenHeight: options.screenHeight
+            )
+            hostControl = hc
+
+            // Headless semantic workers must keep the control channel responsive.
+            // Do not auto-forward host CoreLocation on connect: the guest's private
+            // simulation path can block vphoned's serial request loop during boot.
+            // Explicit MCP `location_set` remains available when location is needed.
+            control.onConnect = { [weak self] caps in
                 Task { @MainActor [weak self] in
                     await self?.installPackageIfRequested(caps: caps)
                 }

@@ -31,6 +31,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (AXUIElementRef _Nullable)copySystemWideElement;
 
 - (BOOL)getPid:(pid_t *)pidOut fromElement:(AXUIElementRef)element;
+- (NSArray<NSString *> *)copyActionNamesForElement:(AXUIElementRef)element;
+- (AXError)performAction:(CFStringRef)action onElement:(AXUIElementRef)element;
 - (NSString *)errorStringForAXError:(AXError)error;
 - (AXUIElementRef _Nullable)copyHitTestElementAtPoint:(CGPoint)point
                                           expectedPid:(pid_t)expectedPid

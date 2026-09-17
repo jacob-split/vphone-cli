@@ -23,6 +23,7 @@ enum {
     kAXErrorInvalidUIElement         = -25202,
     kAXErrorCannotComplete           = -25204,
     kAXErrorAttributeUnsupported     = -25205,
+    kAXErrorActionUnsupported        = -25206,
     kAXErrorNoValue                  = -25212,
     kAXErrorNotImplemented           = -25208,
 };
@@ -93,6 +94,10 @@ typedef AXError (*AXUIElementCopyElementUsingDisplayIdAtPositionFunc)(AXUIElemen
 
 // Get pid associated with an AX element.
 typedef AXError (*AXUIElementGetPidFunc)(AXUIElementRef element, pid_t *pid);
+
+// Ask a remote accessibility element to perform a named action (for example AXPress).
+typedef AXError (*AXUIElementCopyActionNamesFunc)(AXUIElementRef element, CFArrayRef *names);
+typedef AXError (*AXUIElementPerformActionFunc)(AXUIElementRef element, CFStringRef action);
 
 // iOS private helpers used by AXRuntime to associate remote PIDs before
 // cross-process queries.

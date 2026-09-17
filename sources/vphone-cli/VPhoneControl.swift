@@ -18,7 +18,7 @@ class VPhoneControl {
     private static let protocolVersion = 1
     private static let vsockPort: UInt32 = 1337
     private static let reconnectDelay: TimeInterval = 3
-    private static let handshakeTimeout: TimeInterval = 8
+    private static let handshakeTimeout: TimeInterval = 30
     private static let defaultRequestTimeout: TimeInterval = 10
     private static let slowRequestTimeout: TimeInterval = 30
     private static let transferRequestTimeout: TimeInterval = 180
@@ -37,10 +37,14 @@ class VPhoneControl {
     /// touchscreen dext receives reports but emits no digitizer events, so the
     /// UI never sees touches. 26.x bases keep the native VZ multitouch path.
     var useGuestTouchInjection: Bool {
-        guard isConnected, guestCaps.contains("touch"),
-              let major = guestIOSVersion.flatMap({ Int($0.split(separator: ".").first ?? "") })
-        else { return false }
-        return major < 26
+        guard isConnected, guestCaps.contains("touch") else { return false }
+        if let major = guestIOSVersion.flatMap({ Int($0.split(separator: ".").first ?? "") }) {
+            return major < 26
+        }
+        // The persistent jailbreak worker intentionally omits version metadata
+        // during early boot. Its touch capability is the TrollVNC-style guest
+        // IOHID path, which is more reliable than VZ touchscreen delivery here.
+        return variant == .jb
     }
     /// Path to the signed vphoned binary. When set, enables auto-update.
     var guestBinaryURL: URL?
@@ -56,6 +60,8 @@ class VPhoneControl {
     private var nextRequestId: UInt64 = 0
     private var connectionAttemptToken: UInt64 = 0
     private var reconnectWorkItem: DispatchWorkItem?
+    private var reconnectWatchdog: DispatchSourceTimer?
+    private var heartbeatInFlight = false
     public var variant: VPhoneVirtualMachine.Variant = .regular
 
     init(variant: VPhoneVirtualMachine.Variant) {
@@ -95,6 +101,13 @@ class VPhoneControl {
             req.handler(.failure(error))
         }
     }
+
+    private nonisolated func pendingRequestCount() -> Int {
+        pendingLock.lock()
+        defer { pendingLock.unlock() }
+        return pendingRequests.count
+    }
+
 
     enum ControlError: Error, CustomStringConvertible {
         case notConnected
@@ -145,6 +158,7 @@ class VPhoneControl {
     func connect(device: VZVirtioSocketDevice) {
         self.device = device
         cancelReconnect()
+        startReconnectWatchdog()
         loadGuestBinary()
         attemptConnect()
     }
@@ -304,7 +318,7 @@ class VPhoneControl {
     }
 
     /// Inject a single-finger digitizer touch guest-side (bypasses VZ USB touch).
-    /// phase: 0 = down, 1 = move, 3 = up. x/y are normalized 0..1, top-left origin.
+    /// phase: 0 = down, 1 = move, 3 = up. x/y are normalized 0...1, top-left origin.
     func sendTouch(phase: Int, x: Double, y: Double) {
         nextRequestId += 1
         let msg: [String: Any] = [
@@ -333,8 +347,8 @@ class VPhoneControl {
         return DevModeStatus(enabled: enabled)
     }
 
-    func sendPing() async throws {
-        _ = try await sendRequest(["t": "ping"])
+    func sendPing(timeout: TimeInterval? = nil) async throws {
+        _ = try await sendRequest(["t": "ping"], timeoutOverride: timeout)
     }
 
     func sendVersion() async throws -> String {
@@ -350,7 +364,9 @@ class VPhoneControl {
     // MARK: - Async Request-Response
 
     /// Send a request and await the response. Returns the response dict and optional raw data.
-    func sendRequest(_ dict: [String: Any]) async throws -> ([String: Any], Data?) {
+    func sendRequest(
+        _ dict: [String: Any], timeoutOverride: TimeInterval? = nil
+    ) async throws -> ([String: Any], Data?) {
         guard let fd = connection?.fileDescriptor else {
             throw ControlError.notConnected
         }
@@ -361,7 +377,7 @@ class VPhoneControl {
         msg["v"] = Self.protocolVersion
         msg["id"] = reqId
         let requestType = msg["t"] as? String ?? "unknown"
-        let timeout = Self.timeoutForRequest(type: requestType)
+        let timeout = timeoutOverride ?? Self.timeoutForRequest(type: requestType)
 
         return try await withCheckedThrowingContinuation { continuation in
             addPending(id: reqId) { result in
@@ -372,6 +388,7 @@ class VPhoneControl {
             guard writeMessage(fd: fd, dict: msg) else {
                 _ = removePending(id: reqId)
                 continuation.resume(throwing: ControlError.notConnected)
+                disconnect()
                 return
             }
         }
@@ -692,6 +709,30 @@ class VPhoneControl {
         }
     }
 
+    func networkStatus() async throws -> [String: Any] {
+        guard guestCaps.contains("network") else {
+            throw ControlError.unsupportedCapability("network")
+        }
+        let (resp, _) = try await sendRequest(["t": "network_status"])
+        return resp
+    }
+
+    func audioStatus() async throws -> [String: Any] {
+        guard guestCaps.contains("audio") else {
+            throw ControlError.unsupportedCapability("audio")
+        }
+        let (resp, _) = try await sendRequest(["t": "audio_status"])
+        return resp
+    }
+
+    func audioProbe() async throws -> [String: Any] {
+        guard guestCaps.contains("audio") else {
+            throw ControlError.unsupportedCapability("audio")
+        }
+        let (resp, _) = try await sendRequest(["t": "audio_probe"])
+        return resp
+    }
+
     // MARK: - Semantic Accessibility
 
     private func semanticAccessibilityRequest(
@@ -712,6 +753,14 @@ class VPhoneControl {
 
     func accessibilityBootstrap() async throws -> [String: Any] {
         try await semanticAccessibilityRequest("accessibility_bootstrap")
+    }
+
+    func accessibilityDeviceState() async throws -> [String: Any] {
+        try await semanticAccessibilityRequest("accessibility_device_state")
+    }
+
+    func semanticAccessibilityRaw(type: String, payload: [String: Any] = [:]) async throws -> [String: Any] {
+        try await semanticAccessibilityRequest(type, payload: payload)
     }
 
     func accessibilityTree(
@@ -746,12 +795,13 @@ class VPhoneControl {
     }
 
     func accessibilityAction(
-        selector: [String: Any], action: String = "tap", maxDepth: Int = 20
+        selector: [String: Any], action: String = "tap", text: String? = nil, maxDepth: Int = 20
     ) async throws -> [String: Any] {
-        try await semanticAccessibilityRequest(
-            "accessibility_action",
-            payload: ["selector": selector, "action": action, "max_depth": maxDepth]
-        )
+        var payload: [String: Any] = [
+            "selector": selector, "action": action, "max_depth": maxDepth,
+        ]
+        if let text { payload["text"] = text }
+        return try await semanticAccessibilityRequest("accessibility_action", payload: payload)
     }
 
     // MARK: - Location
@@ -776,7 +826,8 @@ class VPhoneControl {
             "ts": Date().timeIntervalSince1970,
         ]
         guard let fd = connection?.fileDescriptor, writeMessage(fd: fd, dict: msg) else {
-            print("[control] sendLocation failed (not connected)")
+            print("[control] sendLocation failed; reconnecting to avoid a partial frame")
+            disconnect()
             return
         }
         print("[control] location lat=\(latitude) lon=\(longitude)")
@@ -932,6 +983,44 @@ class VPhoneControl {
         reconnectWorkItem = nil
     }
 
+    private func startReconnectWatchdog() {
+        reconnectWatchdog?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            guard self.device != nil else { return }
+
+            if self.isConnected {
+                // VZ can leave a stale host fd apparently writable after the guest
+                // reboots. Probe only when the channel is otherwise idle; a failed
+                // heartbeat invalidates the connection so the normal reconnect path
+                // can bind to the current vphoned instance.
+                guard !self.heartbeatInFlight, self.pendingRequestCount() == 0 else { return }
+                self.heartbeatInFlight = true
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    defer { self.heartbeatInFlight = false }
+                    do {
+                        try await self.sendPing(timeout: 30)
+                    } catch {
+                        print("[control] heartbeat failed: \(error); reconnecting")
+                        self.disconnect()
+                    }
+                }
+                return
+            }
+
+            // Do not overlap an in-flight handshake or an already scheduled retry.
+            guard self.connection == nil, self.reconnectWorkItem == nil else { return }
+            print("[control] reconnect watchdog: no active attempt; reconnecting now")
+            self.loadGuestBinary()
+            self.attemptConnect()
+        }
+        reconnectWatchdog = timer
+        timer.resume()
+    }
+
     private func scheduleReconnect(for attemptToken: UInt64, reason: String) {
         guard isCurrentAttempt(attemptToken) else { return }
         guard device != nil else { return }
@@ -987,8 +1076,11 @@ class VPhoneControl {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) { [weak self] in
             guard let self else { return }
             guard let pending = removePending(id: id) else { return }
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
                 pending.handler(.failure(ControlError.requestTimedOut(type: type, seconds: timeoutSeconds)))
+                guard let self else { return }
+                print("[control] request timed out (\(type)); invalidating control channel")
+                self.disconnect()
             }
         }
     }
@@ -1001,11 +1093,11 @@ class VPhoneControl {
         let length = UInt32(json.count)
         var header = length.bigEndian
         let headerOK = withUnsafeBytes(of: &header) { buf in
-            Darwin.write(fd, buf.baseAddress!, 4) == 4
+            Self.writeFully(fd: fd, buf: buf.baseAddress!, count: 4)
         }
         guard headerOK else { return false }
         return json.withUnsafeBytes { buf in
-            Darwin.write(fd, buf.baseAddress!, json.count) == json.count
+            Self.writeFully(fd: fd, buf: buf.baseAddress!, count: json.count)
         }
     }
 

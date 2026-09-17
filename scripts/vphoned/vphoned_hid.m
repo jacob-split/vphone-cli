@@ -23,19 +23,23 @@ static IOHIDEventRef (*pFinger)(CFAllocatorRef, uint64_t, uint32_t, uint32_t,
                                 IOHIDFloat, IOHIDFloat, boolean_t, boolean_t, uint32_t);
 static void (*pAppend)(IOHIDEventRef, IOHIDEventRef, uint32_t);
 static void (*pSetInt)(IOHIDEventRef, uint32_t, int);
+static void (*pSetFloat)(IOHIDEventRef, uint32_t, IOHIDFloat);
 
 static IOHIDEventSystemClientRef gClient;
 static dispatch_queue_t gHIDQueue;
 
-// Digitizer event-mask bits and transducer types (IOHIDEventTypes.h).
-#define VP_DIG_RANGE     0x00000001u
-#define VP_DIG_TOUCH     0x00000002u
-#define VP_DIG_POSITION  0x00000004u
-#define VP_DIG_IDENTITY  0x00000020u
-#define VP_TRANSDUCER_HAND   1
-#define VP_TRANSDUCER_FINGER 2
-// kIOHIDEventFieldDigitizerIsDisplayIntegrated: (kIOHIDEventTypeDigitizer<<16)|offset.
-#define VP_FIELD_IS_DISPLAY_INTEGRATED ((((uint32_t)11) << 16) | 25)
+// Digitizer constants matching TrollVNC/STHIDEventGenerator's proven iOS path.
+#define VP_DIG_RANGE       0x00000001u
+#define VP_DIG_TOUCH       0x00000002u
+#define VP_DIG_POSITION    0x00000004u
+#define VP_DIG_IDENTITY    0x00000020u
+#define VP_DIG_ATTRIBUTE   0x00000040u
+#define VP_TRANSDUCER_HAND 3u
+#define VP_FINGER_ID       2u
+#define VP_FIELD_IS_BUILT_IN 4u
+#define VP_FIELD_DIGITIZER_MAJOR_RADIUS ((((uint32_t)11) << 16) + 20u)
+#define VP_FIELD_DIGITIZER_MINOR_RADIUS ((((uint32_t)11) << 16) + 21u)
+#define VP_FIELD_IS_DISPLAY_INTEGRATED  ((((uint32_t)11) << 16) + 25u)
 
 BOOL vp_hid_load(void) {
     if (gClient && pCreate && pKeyboard && pSetSender && pDispatch && gHIDQueue) return YES;
@@ -51,12 +55,13 @@ BOOL vp_hid_load(void) {
     pFinger    = dlsym(h, "IOHIDEventCreateDigitizerFingerEvent");
     pAppend    = dlsym(h, "IOHIDEventAppendEvent");
     pSetInt    = dlsym(h, "IOHIDEventSetIntegerValue");
+    pSetFloat  = dlsym(h, "IOHIDEventSetFloatValue");
 
     if (!pCreate || !pKeyboard || !pSetSender || !pDispatch) {
         NSLog(@"vphoned: missing IOKit symbols");
         return NO;
     }
-    if (!pDigitizer || !pFinger || !pAppend || !pSetInt)
+    if (!pDigitizer || !pFinger || !pAppend || !pSetInt || !pSetFloat)
         NSLog(@"vphoned: digitizer symbols missing, touch injection disabled");
 
     gClient = pCreate(kCFAllocatorDefault);
@@ -73,7 +78,7 @@ BOOL vp_hid_load(void) {
 static void send_hid_event(IOHIDEventRef event) {
     IOHIDEventRef strong = (IOHIDEventRef)CFRetain(event);
     dispatch_async(gHIDQueue, ^{
-        pSetSender(strong, 0x8000000817319372);
+        pSetSender(strong, 0x8000000817319371);
         pDispatch(gClient, strong);
         CFRelease(strong);
     });
@@ -103,47 +108,56 @@ void vp_hid_key(uint32_t page, uint32_t usage, BOOL down) {
     if (ev) { send_hid_event(ev); CFRelease(ev); }
 }
 
-// Build a display-integrated hand digitizer event carrying one finger and
-// dispatch it. Mirrors WebKit's HIDEventGenerator single-touch path.
-static void dispatch_digitizer(double x, double y, boolean_t range,
-                               boolean_t touch, uint32_t mask) {
-    if (!pDigitizer || !pFinger || !pAppend || !pSetInt) return;
+// Build the same display-integrated one-finger event shape used by
+// TrollVNC's STHIDEventGenerator. x/y are normalized display coordinates.
+static void dispatch_digitizer(double x, double y, int phase) {
+    if (!pDigitizer || !pFinger || !pAppend || !pSetInt || !pSetFloat) return;
+
+    const boolean_t touching = (phase != 3);
+    uint32_t eventMask;
+    if (phase == 1) {
+        eventMask = VP_DIG_POSITION | VP_DIG_ATTRIBUTE;
+    } else {
+        eventMask = VP_DIG_TOUCH | VP_DIG_IDENTITY;
+    }
 
     uint64_t ts = mach_absolute_time();
-    IOHIDEventRef parent = pDigitizer(kCFAllocatorDefault, ts, VP_TRANSDUCER_HAND,
-                                      0, 0, mask, 0, x, y, 0, 0, 0, range, touch, 0);
+    IOHIDEventRef parent = pDigitizer(
+        kCFAllocatorDefault, ts, VP_TRANSDUCER_HAND,
+        0, 0, eventMask, 0,
+        0, 0, 0, 0, 0,
+        0, touching, 0
+    );
     if (!parent) return;
+    pSetInt(parent, VP_FIELD_IS_BUILT_IN, 1);
     pSetInt(parent, VP_FIELD_IS_DISPLAY_INTEGRATED, 1);
 
-    IOHIDEventRef finger = pFinger(kCFAllocatorDefault, ts, 1, VP_TRANSDUCER_FINGER,
-                                   mask, x, y, 0, 0, 0, range, touch, 0);
+    // TrollVNC passes the GSEvent proximity bits through these boolean_t
+    // parameters verbatim: InRange=1 and InTouch=2. Preserve those values
+    // rather than collapsing the touch bit to boolean 1.
+    const boolean_t inRange = touching ? 1 : 0;
+    const boolean_t inTouch = touching ? 2 : 0;
+    const IOHIDFloat radius = touching ? 5.0 : 0.0;
+    IOHIDEventRef finger = pFinger(
+        kCFAllocatorDefault, ts, VP_FINGER_ID, VP_FINGER_ID,
+        eventMask, x, y, 0,
+        0, 90.0, inRange, inTouch, 0
+    );
     if (finger) {
-        pSetInt(finger, VP_FIELD_IS_DISPLAY_INTEGRATED, 1);
+        pSetFloat(finger, VP_FIELD_DIGITIZER_MINOR_RADIUS, radius);
+        pSetFloat(finger, VP_FIELD_DIGITIZER_MAJOR_RADIUS, radius);
         pAppend(parent, finger, 0);
         CFRelease(finger);
     }
 
-    IOHIDEventRef strong = (IOHIDEventRef)CFRetain(parent);
-    dispatch_async(gHIDQueue, ^{
-        pSetSender(strong, 0x8000000817319372);
-        pDispatch(gClient, strong);
-        CFRelease(strong);
-    });
+    send_hid_event(parent);
     CFRelease(parent);
 }
 
 void vp_hid_touch(int phase, double x, double y) {
     if ((!gClient || !pDispatch || !gHIDQueue) && !vp_hid_load()) return;
-    switch (phase) {
-    case 0: // down
-        dispatch_digitizer(x, y, 1, 1, VP_DIG_TOUCH | VP_DIG_IDENTITY);
-        break;
-    case 1: // move
-        dispatch_digitizer(x, y, 1, 1, VP_DIG_POSITION);
-        break;
-    case 3: // up
-    default:
-        dispatch_digitizer(x, y, 0, 0, VP_DIG_TOUCH | VP_DIG_IDENTITY);
-        break;
-    }
+    // Clamp normalized coordinates exactly once at the daemon boundary.
+    if (x < 0) x = 0; else if (x > 1) x = 1;
+    if (y < 0) y = 0; else if (y > 1) y = 1;
+    dispatch_digitizer(x, y, phase == 1 ? 1 : (phase == 0 ? 0 : 3));
 }
