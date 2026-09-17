@@ -6,10 +6,18 @@
 	<string>com.vphone.vphoned</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/vphoned</string>
+		<string>/iosbinpack64/bin/bash</string>
+		<string>-c</string>
+		<string>echo &quot;[vphoned-launch] starting&quot; &gt;/dev/console; /usr/bin/vphoned; rc=$?; echo &quot;[vphoned-launch] exited rc=$rc&quot; &gt;/dev/console; exit $rc</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+	<key>ThrottleInterval</key>
+	<integer>2</integer>
 	<key>KeepAlive</key>
 	<true/>
 </dict>

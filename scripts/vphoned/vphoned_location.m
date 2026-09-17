@@ -11,6 +11,7 @@ static SEL gStartSimSel = NULL;
 static BOOL gLocationLoaded = NO;
 
 BOOL vp_location_load(void) {
+    if (gLocationLoaded) return YES;
     void *h = dlopen("/System/Library/Frameworks/CoreLocation.framework/CoreLocation", RTLD_NOW);
     if (!h) { NSLog(@"vphoned: dlopen CoreLocation failed"); return NO; }
 

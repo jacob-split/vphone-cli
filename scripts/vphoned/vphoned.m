@@ -52,6 +52,7 @@
 
 static BOOL gClipboardAvailable = NO;
 static BOOL gAppsAvailable = NO;
+static BOOL gHIDAvailable = NO;
 
 #define INSTALL_PATH "/usr/bin/vphoned"
 #define CACHE_PATH "/var/root/Library/Caches/vphoned"
@@ -190,6 +191,12 @@ static NSDictionary *handle_command(NSDictionary *msg) {
   id reqId = msg[@"id"];
 
   if ([type isEqualToString:@"hid"]) {
+    if (!gHIDAvailable) gHIDAvailable = vp_hid_load();
+    if (!gHIDAvailable) {
+      NSMutableDictionary *r = vp_make_response(@"err", reqId);
+      r[@"msg"] = @"HID unavailable";
+      return r;
+    }
     uint32_t page = [msg[@"page"] unsignedIntValue];
     uint32_t usage = [msg[@"usage"] unsignedIntValue];
     NSNumber *downVal = msg[@"down"];
@@ -202,6 +209,12 @@ static NSDictionary *handle_command(NSDictionary *msg) {
   }
 
   if ([type isEqualToString:@"touch"]) {
+    if (!gHIDAvailable) gHIDAvailable = vp_hid_load();
+    if (!gHIDAvailable) {
+      NSMutableDictionary *r = vp_make_response(@"err", reqId);
+      r[@"msg"] = @"HID unavailable";
+      return r;
+    }
     int phase = [msg[@"phase"] intValue];
     double x = [msg[@"x"] doubleValue];
     double y = [msg[@"y"] doubleValue];
@@ -210,7 +223,7 @@ static NSDictionary *handle_command(NSDictionary *msg) {
   }
 
   if ([type isEqualToString:@"devmode"]) {
-    if (!vp_devmode_available()) {
+    if (!vp_devmode_available() && !vp_devmode_load()) {
       NSMutableDictionary *r = vp_make_response(@"err", reqId);
       r[@"msg"] = @"XPC not available";
       return r;
@@ -247,6 +260,11 @@ static NSDictionary *handle_command(NSDictionary *msg) {
   }
 
   if ([type isEqualToString:@"location"]) {
+    if (!vp_location_available() && !vp_location_load()) {
+      NSMutableDictionary *r = vp_make_response(@"err", reqId);
+      r[@"msg"] = @"location simulation unavailable";
+      return r;
+    }
     double lat = [msg[@"lat"] doubleValue];
     double lon = [msg[@"lon"] doubleValue];
     double alt = [msg[@"alt"] doubleValue];
@@ -259,6 +277,11 @@ static NSDictionary *handle_command(NSDictionary *msg) {
   }
 
   if ([type isEqualToString:@"location_stop"]) {
+    if (!vp_location_available() && !vp_location_load()) {
+      NSMutableDictionary *r = vp_make_response(@"err", reqId);
+      r[@"msg"] = @"location simulation unavailable";
+      return r;
+    }
     vp_location_clear();
     return vp_make_response(@"ok", reqId);
   }
@@ -284,7 +307,9 @@ static NSDictionary *handle_command(NSDictionary *msg) {
 static BOOL handle_client(int fd) {
   BOOL should_restart = NO;
   @autoreleasepool {
+    dprintf(STDERR_FILENO, "[vphoned-handshake] accepted fd=%d\n", fd);
     NSDictionary *hello = vp_read_message(fd);
+    dprintf(STDERR_FILENO, "[vphoned-handshake] read hello=%s\n", hello ? "yes" : "no");
     if (!hello) {
       close(fd);
       return NO;
@@ -312,7 +337,9 @@ static BOOL handle_client(int fd) {
       return NO;
     }
 
-    // Hash comparison for auto-update
+    // Hash comparison for auto-update. This is local file I/O only; all
+    // network/OS metadata is deliberately excluded from the boot handshake.
+    dprintf(STDERR_FILENO, "[vphoned-handshake] validating version/hash\n");
     NSString *hostHash = hello[@"bin_hash"];
     BOOL needUpdate = NO;
     if (hostHash.length > 0) {
@@ -326,21 +353,15 @@ static BOOL handle_client(int fd) {
       }
     }
 
-    // Build capabilities list
-    NSMutableArray *caps = [NSMutableArray
-        arrayWithObjects:@"hid", @"devmode", @"file", @"keychain", nil];
-    if (vp_location_available())
-      [caps addObject:@"location"];
-    if (vp_custom_installer_available())
-      [caps addObject:@"ipa_install"];
-    if (gClipboardAvailable)
-      [caps addObject:@"clipboard"];
-    if (gAppsAvailable)
-      [caps addObject:@"apps"];
-    [caps addObject:@"url"];
-    [caps addObject:@"settings"];
-    [caps addObject:@"touch"];
-    [caps addObject:@"accessibility_semantic"];
+    dprintf(STDERR_FILENO, "[vphoned-handshake] hash complete needUpdate=%d\n", needUpdate);
+
+    // Advertise the intended control surface without probing private frameworks
+    // during handshake. Each optional subsystem initializes lazily on first use,
+    // so a slow/broken framework can never block the core vsock bridge.
+    NSMutableArray *caps = [NSMutableArray arrayWithObjects:
+        @"hid", @"touch", @"devmode", @"location", @"file", @"keychain",
+        @"ipa_install", @"clipboard", @"apps", @"url", @"settings",
+        @"accessibility_semantic", nil];
 
     NSMutableDictionary *helloResp = [@{
       @"v" : @PROTOCOL_VERSION,
@@ -348,21 +369,17 @@ static BOOL handle_client(int fd) {
       @"name" : @"vphoned",
       @"caps" : caps,
     } mutableCopy];
-    NSOperatingSystemVersion osv =
-        [[NSProcessInfo processInfo] operatingSystemVersion];
-    helloResp[@"ios"] =
-        [NSString stringWithFormat:@"%ld.%ld.%ld", (long)osv.majorVersion,
-                                   (long)osv.minorVersion, (long)osv.patchVersion];
-    NSString *ip = primary_ipv4_address();
-    if (ip)
-      helloResp[@"ip"] = ip;
+    // Early boot must not block on getifaddrs or OS metadata services. The host
+    // treats both `ios` and `ip` as optional and can query richer state later.
     if (needUpdate)
       helloResp[@"need_update"] = @YES;
 
+    dprintf(STDERR_FILENO, "[vphoned-handshake] sending hello\n");
     if (!vp_write_message(fd, helloResp)) {
       close(fd);
       return NO;
     }
+    dprintf(STDERR_FILENO, "[vphoned-handshake] hello sent\n");
     NSLog(@"vphoned: client connected (v%d)%s", PROTOCOL_VERSION,
           needUpdate ? " [update pending]" : "");
 
@@ -476,27 +493,13 @@ int main(int argc, char *argv[]) {
     const char *selfPath = self_executable_path();
     NSLog(@"vphoned: starting (pid=%d, path=%s)", getpid(), selfPath ?: "?");
 
-#if !LESS
-    if (selfPath && strcmp(selfPath, INSTALL_PATH) == 0 &&
-        access(CACHE_PATH, X_OK) == 0) {
-      NSLog(@"vphoned: found cached binary at %s, exec'ing", CACHE_PATH);
-      execv(CACHE_PATH, argv);
-      NSLog(@"vphoned: execv failed: %s — continuing with installed binary",
-            strerror(errno));
-      unlink(CACHE_PATH);
-    }
-#endif
+    // The installed /usr/bin/vphoned is the cold-boot anchor. Do not exec a
+    // Data-volume cached update here: its dynamic trust state may not survive a
+    // cold boot. Host-pushed updates are exec'd immediately in the current boot
+    // after they are received (see the update-restart path below).
 
-    if (!vp_hid_load())
-      return 1;
-    if (!vp_devmode_load())
-      NSLog(@"vphoned: XPC unavailable, devmode disabled");
-    vp_location_load();
-
-    gClipboardAvailable = vp_clipboard_load();
-    gAppsAvailable = vp_apps_load();
-    vp_vcam_start();
-
+    // Core control must come up before any optional private framework. HID,
+    // devmode, location, clipboard, and app management all initialize lazily.
     int sock = socket(AF_VSOCK, SOCK_STREAM, 0);
     if (sock < 0) {
       perror("vphoned: socket(AF_VSOCK)");
@@ -526,6 +529,12 @@ int main(int argc, char *argv[]) {
 
     NSLog(@"vphoned: listening on vsock port %d", VPHONED_PORT);
 
+    // Camera transport is independent of control. Start it off the critical
+    // path so camera initialization can never delay the control listener.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+      @autoreleasepool { vp_vcam_start(); }
+    });
+
     for (;;) {
       int client = accept(sock, NULL, NULL);
       if (client < 0) {
@@ -534,8 +543,15 @@ int main(int argc, char *argv[]) {
         continue;
       }
       if (handle_client(client)) {
-        NSLog(@"vphoned: exiting for update restart");
+        NSLog(@"vphoned: applying host update in-process");
         close(sock);
+#if !LESS
+        if (access(CACHE_PATH, X_OK) == 0) {
+          execv(CACHE_PATH, argv);
+          NSLog(@"vphoned: update exec failed: %s", strerror(errno));
+          unlink(CACHE_PATH);
+        }
+#endif
         return 0;
       }
     }

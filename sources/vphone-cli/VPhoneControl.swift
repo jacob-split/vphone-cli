@@ -972,7 +972,9 @@ class VPhoneControl {
         case "file_get", "file_put", "ipa_install":
             transferRequestTimeout
         case "devmode", "file_list", "file_delete", "file_rename", "file_mkdir", "keychain_list",
-             "app_list", "app_launch", "open_url", "accessibility_tree":
+             "app_list", "app_launch", "open_url",
+             "accessibility_status", "accessibility_bootstrap", "accessibility_tree",
+             "accessibility_find", "accessibility_hit_test", "accessibility_action":
             slowRequestTimeout
         default:
             defaultRequestTimeout

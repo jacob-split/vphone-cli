@@ -53,6 +53,9 @@ else
   P="$PROJ/.tools/bin:$PROJ/.venv/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 fi
 export PATH="$P"
+# Never let privileged CFW Python helpers write root-owned __pycache__ files
+# into the source tree or a bundled .app Resources directory.
+export PYTHONDONTWRITEBYTECODE=1
 PY="${VPHONE_PYTHON:-$PROJ/.venv/bin/python3}"
 
 if lsof "$IMG" >/dev/null 2>&1; then

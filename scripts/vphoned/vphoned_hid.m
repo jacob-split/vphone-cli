@@ -38,6 +38,7 @@ static dispatch_queue_t gHIDQueue;
 #define VP_FIELD_IS_DISPLAY_INTEGRATED ((((uint32_t)11) << 16) | 25)
 
 BOOL vp_hid_load(void) {
+    if (gClient && pCreate && pKeyboard && pSetSender && pDispatch && gHIDQueue) return YES;
     void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
     if (!h) { NSLog(@"vphoned: dlopen IOKit failed"); return NO; }
 
@@ -79,6 +80,7 @@ static void send_hid_event(IOHIDEventRef event) {
 }
 
 void vp_hid_press(uint32_t page, uint32_t usage) {
+    if ((!gClient || !pKeyboard || !pDispatch || !gHIDQueue) && !vp_hid_load()) return;
     IOHIDEventRef down = pKeyboard(kCFAllocatorDefault, mach_absolute_time(),
                                    page, usage, 1, 0);
     if (!down) return;
@@ -95,6 +97,7 @@ void vp_hid_press(uint32_t page, uint32_t usage) {
 }
 
 void vp_hid_key(uint32_t page, uint32_t usage, BOOL down) {
+    if ((!gClient || !pKeyboard || !pDispatch || !gHIDQueue) && !vp_hid_load()) return;
     IOHIDEventRef ev = pKeyboard(kCFAllocatorDefault, mach_absolute_time(),
                                  page, usage, down ? 1 : 0, 0);
     if (ev) { send_hid_event(ev); CFRelease(ev); }
@@ -130,6 +133,7 @@ static void dispatch_digitizer(double x, double y, boolean_t range,
 }
 
 void vp_hid_touch(int phase, double x, double y) {
+    if ((!gClient || !pDispatch || !gHIDQueue) && !vp_hid_load()) return;
     switch (phase) {
     case 0: // down
         dispatch_digitizer(x, y, 1, 1, VP_DIG_TOUCH | VP_DIG_IDENTITY);

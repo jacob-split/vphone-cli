@@ -38,8 +38,13 @@ struct VPhoneVMLaunchCommand: ParsableCommand {
         // Host preflight — same gate make boot applies. Point it at THIS binary
         // (VPHONE_CLI_BIN) so it checks the vphone-cli we're running, not a dev
         // .build/release path that doesn't exist inside the bundled .app.
+        // A VM's restore-info records the firmware variant used to build it.
+        // Reuse that on normal launches unless the caller explicitly overrides -V;
+        // otherwise the child boot command silently defaults to regular.
+        let effectiveVariant = variant ?? VPhoneRestoreInfo.load(fromBundle: bundle)?.variant
+
         var preflightArgs = ["--assert-bootable"]
-        if variant == "less" { preflightArgs.append("--less") }
+        if effectiveVariant == "less" { preflightArgs.append("--less") }
         var preflightEnv = ProcessInfo.processInfo.environment
         preflightEnv["VPHONE_CLI_BIN"] = bootBinary.path
         let pre = try VPhoneProcessRunner.runCapturing(
@@ -63,7 +68,7 @@ struct VPhoneVMLaunchCommand: ParsableCommand {
         var args = ["--config", bundle.configURL.path]
         if dfu { args.append("--dfu") }
         if headless { args.append("--headless") }
-        if let variant { args += ["--variant", variant] }
+        if let effectiveVariant { args += ["--variant", effectiveVariant] }
         if noVphoned { args.append("--no-vphoned") }
         if let kernelDebugPort { args += ["--kernel-debug-port", String(kernelDebugPort)] }
 

@@ -17,6 +17,7 @@ static Class gPasteboardClass = Nil;
 static NSData *(*pImagePNGRep)(id) = NULL;
 
 BOOL vp_clipboard_load(void) {
+  if (gClipboardLoaded) return YES;
   void *h =
       dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_LAZY);
   if (!h) {
@@ -51,7 +52,7 @@ NSDictionary *vp_handle_clipboard_command(int fd, NSDictionary *msg) {
   NSString *type = msg[@"t"];
   id reqId = msg[@"id"];
 
-  if (!gClipboardLoaded) {
+  if (!gClipboardLoaded && !vp_clipboard_load()) {
     NSMutableDictionary *r = vp_make_response(@"err", reqId);
     r[@"msg"] = @"clipboard not available (UIKit not loaded)";
     return r;

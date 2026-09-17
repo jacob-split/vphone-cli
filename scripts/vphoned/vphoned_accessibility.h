@@ -8,3 +8,7 @@
 #import <Foundation/Foundation.h>
 
 NSDictionary *vp_handle_accessibility_command(NSDictionary *msg);
+
+/// Best-effort foreground app context from the SpringBoard semantic broker.
+/// Returns nil when the broker is unavailable (non-JB guests use app fallbacks).
+NSDictionary *vp_accessibility_frontmost_context(void);

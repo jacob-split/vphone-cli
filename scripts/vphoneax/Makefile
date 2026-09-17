@@ -1,7 +1,7 @@
 OUT := VPhoneAX.dylib
 VENDOR := vendor/ios-mcp
 VENDOR_SRCS := $(VENDOR)/MCPAXAttributeBridge.m $(VENDOR)/MCPAXNodeSource.m $(VENDOR)/MCPAXQueryContext.m $(VENDOR)/MCPAXRemoteContextResolver.m
-SRCS := VPhoneAX.m VPhoneAXRuntime.m VPhoneAXBroker.m MCPLogger.m $(VENDOR_SRCS)
+SRCS := VPhoneAX.m VPhoneAXRuntime.m VPhoneAXBroker.m VPhoneAXLog.m MCPLogger.m $(VENDOR_SRCS)
 HEADERS := $(wildcard *.h) $(wildcard $(VENDOR)/*.h)
 
 .PHONY: all clean

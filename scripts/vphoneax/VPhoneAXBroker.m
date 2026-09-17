@@ -1,5 +1,6 @@
 #import "VPhoneAXBroker.h"
 #import "VPhoneAXRuntime.h"
+#import "VPhoneAXLog.h"
 #import "vendor/ios-mcp/MCPAXAttributeBridge.h"
 #import "vendor/ios-mcp/MCPAXNodeSource.h"
 #import "vendor/ios-mcp/MCPAXQueryContext.h"
@@ -80,7 +81,32 @@ static NSDictionary *VPTapForFrame(NSDictionary *frame) {
     return @{@"x": @(x.doubleValue + w.doubleValue / 2.0), @"y": @(y.doubleValue + h.doubleValue / 2.0)};
 }
 
+static BOOL VPAXPointOnScreen(NSDictionary *point) {
+    if (![point isKindOfClass:[NSDictionary class]]) return NO;
+    NSNumber *x=point[@"x"] ?: point[@"X"], *y=point[@"y"] ?: point[@"Y"];
+    if (!x || !y) return NO;
+    // AX occasionally emits the sentinel point (0,0) for a focused control after
+    // its value changes. Treat that as unavailable rather than tapping top-left.
+    if (x.doubleValue == 0.0 && y.doubleValue == 0.0) return NO;
+    CGRect bounds=UIScreen.mainScreen.bounds;
+    return x.doubleValue >= 0 && x.doubleValue <= CGRectGetWidth(bounds) &&
+           y.doubleValue >= 0 && y.doubleValue <= CGRectGetHeight(bounds);
+}
+
+
 static NSString *VPAXNormalizedRole(NSDictionary *node) {
+    NSNumber *automationType = [node[@"automation_type"] isKindOfClass:[NSNumber class]] ? node[@"automation_type"] : nil;
+    if (automationType) {
+        NSDictionary<NSNumber *, NSString *> *types = @{
+            @9:@"button", @19:@"keyboard", @20:@"keyboard_key", @21:@"navigation_bar",
+            @22:@"tab_bar", @26:@"table", @27:@"cell", @32:@"collection", @33:@"slider",
+            @38:@"picker", @39:@"picker", @40:@"switch", @42:@"link", @43:@"image",
+            @45:@"search_field", @46:@"scroll_view", @48:@"text", @49:@"text_field",
+            @50:@"secure_text_field", @52:@"text_view", @58:@"web_view", @75:@"cell"
+        };
+        NSString *mapped = types[automationType];
+        if (mapped) return mapped;
+    }
     NSString *raw = VPAXString(node[@"role"]) ?: VPAXString(node[@"type"]) ?: @"";
     NSString *lower = raw.lowercaseString;
     NSDictionary *map = @{
@@ -93,6 +119,9 @@ static NSString *VPAXNormalizedRole(NSDictionary *node) {
         @"alert": @"alert", @"window": @"window", @"application": @"application"
     };
     for (NSString *needle in map) if ([lower containsString:needle]) return map[needle];
+
+    NSString *semanticText = VPAXString(node[@"text"]) ?: VPAXString(node[@"label"]) ?: VPAXString(node[@"placeholder"]) ?: @"";
+    if ([semanticText rangeOfString:@"search field" options:NSCaseInsensitiveSearch].location != NSNotFound) return @"search_field";
 
     unsigned long long traits = [node[@"traits"] respondsToSelector:@selector(unsignedLongLongValue)] ? [node[@"traits"] unsignedLongLongValue] : 0;
     if (traits & UIAccessibilityTraitButton) return @"button";
@@ -123,7 +152,10 @@ static BOOL VPAXRoleClickable(NSString *role) {
 @property(nonatomic) MCPAXNodeSource *nodeSource;
 @property(nonatomic) MCPAXRemoteContextResolver *resolver;
 @property(nonatomic) NSDictionary *bootstrap;
+@property(nonatomic) BOOL bootstrapInFlight;
+@property(nonatomic) BOOL bootstrapComplete;
 @property(nonatomic) uint64_t generation;
+@property(nonatomic) BOOL semanticOperational;
 @end
 
 @implementation VPhoneAXBroker
@@ -136,28 +168,76 @@ static BOOL VPAXRoleClickable(NSString *role) {
         _bridge = [MCPAXAttributeBridge new];
         _nodeSource = [[MCPAXNodeSource alloc] initWithAttributeBridge:_bridge];
         _resolver = [MCPAXRemoteContextResolver new];
+        _bootstrap = @{@"state": @"not_started"};
+        _bootstrapInFlight = NO;
+        _bootstrapComplete = NO;
         _generation = 0;
+        _semanticOperational = NO;
     }
     return self;
 }
 
 - (void)start {
     if (self.listenFD >= 0) return;
-    self.bootstrap = VPhoneAXBootstrapRuntime();
     NSString *dir = VPAXSocketPath.stringByDeletingLastPathComponent;
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0770} error:nil];
+    NSError *dirError = nil;
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES
+                                               attributes:@{NSFilePosixPermissions:@0770}
+                                                    error:&dirError];
+    if (dirError) VPAXLog(@"state directory error: %@", dirError);
     unlink(VPAXSocketPath.fileSystemRepresentation);
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) { NSLog(@"[VPhoneAX] socket failed: %s", strerror(errno)); return; }
+    if (fd < 0) { VPAXLog(@"socket failed: %s", strerror(errno)); return; }
     struct sockaddr_un addr = {0}; addr.sun_family = AF_UNIX;
     strlcpy(addr.sun_path, VPAXSocketPath.fileSystemRepresentation, sizeof(addr.sun_path));
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(fd, 4) != 0) {
-        NSLog(@"[VPhoneAX] bind/listen failed: %s", strerror(errno)); close(fd); return;
+        VPAXLog(@"bind/listen failed: %s", strerror(errno)); close(fd); return;
     }
     chmod(VPAXSocketPath.fileSystemRepresentation, 0660);
     self.listenFD = fd;
-    NSLog(@"[VPhoneAX] broker listening on %@", VPAXSocketPath);
+    VPAXLog(@"broker listening on %@", VPAXSocketPath);
     dispatch_async(self.queue, ^{ [self acceptLoop]; });
+    [self beginBootstrap:@"broker-start"];
+}
+
+- (void)beginBootstrap:(NSString *)reason {
+    @synchronized (self) {
+        if (self.bootstrapInFlight) {
+            VPAXLog(@"bootstrap already in flight (%@)", reason ?: @"unknown");
+            return;
+        }
+        self.bootstrapInFlight = YES;
+        self.bootstrapComplete = NO;
+        self.bootstrap = @{
+            @"state": @"starting",
+            @"reason": reason ?: @"unknown",
+            @"started_at": @([[NSDate date] timeIntervalSince1970])
+        };
+    }
+    VPAXLog(@"bootstrap begin (%@)", reason ?: @"unknown");
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSDictionary *result = nil;
+        @try {
+            result = VPhoneAXBootstrapRuntime();
+        } @catch (NSException *exception) {
+            result = @{
+                @"ok": @NO, @"state": @"failed",
+                @"exception": exception.name ?: @"NSException",
+                @"reason": exception.reason ?: @"unknown"
+            };
+        }
+        NSMutableDictionary *final = [result mutableCopy] ?: [NSMutableDictionary dictionary];
+        BOOL ok = [final[@"ok"] boolValue];
+        final[@"state"] = ok ? @"ready" : @"failed";
+        final[@"finished_at"] = @([[NSDate date] timeIntervalSince1970]);
+        @synchronized (self) {
+            self.bootstrap = [final copy];
+            self.bootstrapComplete = YES;
+            self.bootstrapInFlight = NO;
+        }
+        VPAXLog(@"bootstrap finished state=%@", final[@"state"]);
+    });
 }
 
 - (void)stop { int fd=self.listenFD; self.listenFD=-1; if (fd>=0) close(fd); unlink(VPAXSocketPath.fileSystemRepresentation); }
@@ -187,7 +267,24 @@ static BOOL VPAXRoleClickable(NSString *role) {
     node[@"path"] = path;
     BOOL clickable = [source[@"clickable"] boolValue] || [source[@"user_interaction_enabled"] boolValue] || VPAXRoleClickable(role);
     node[@"clickable"] = @(clickable);
-    if (!node[@"tap"]) { NSDictionary *tap = VPTapForFrame(VPAXFrame(source)); if (tap) node[@"tap"] = tap; }
+    NSDictionary *frame = VPAXFrame(source);
+    NSDictionary *frameTap = VPTapForFrame(frame);
+    NSDictionary *reportedTap = [source[@"tap"] isKindOfClass:[NSDictionary class]] ? source[@"tap"] : nil;
+    NSDictionary *centerPoint = [source[@"center_point"] isKindOfClass:[NSDictionary class]] ? source[@"center_point"] : nil;
+    NSDictionary *visiblePoint = [source[@"visible_point"] isKindOfClass:[NSDictionary class]] ? source[@"visible_point"] : nil;
+    if (reportedTap && VPAXPointOnScreen(reportedTap)) {
+        node[@"tap"] = reportedTap;
+        node[@"tap_source"] = @"ax_reported_screen_point";
+    } else if (centerPoint && VPAXPointOnScreen(centerPoint)) {
+        node[@"tap"] = centerPoint;
+        node[@"tap_source"] = @"ax_center_point";
+    } else if (visiblePoint && VPAXPointOnScreen(visiblePoint)) {
+        node[@"tap"] = visiblePoint;
+        node[@"tap_source"] = @"ax_visible_point";
+    } else if (frameTap) {
+        node[@"tap"] = frameTap;
+        node[@"tap_source"] = @"frame_center_fallback";
+    }
     NSArray *children = [source[@"children"] isKindOfClass:[NSArray class]] ? source[@"children"] : nil;
     if (children.count) {
         NSMutableArray *out=[NSMutableArray arrayWithCapacity:children.count];
@@ -271,21 +368,55 @@ static BOOL VPAXRoleClickable(NSString *role) {
 - (NSDictionary *)handleRequest:(NSDictionary *)req {
     NSString *type=VPAXString(req[@"t"]) ?: @"";
     if ([type isEqualToString:@"status"]) {
-        MCPAXQueryContext *ctx=[self context]; NSString *runtimeError=nil; BOOL runtime=[self.bridge ensureRuntimeAvailable:&runtimeError];
-        NSMutableDictionary *r=[@{@"ok":@(runtime),@"runtime":VPhoneAXRuntimeStatus(),@"bootstrap":self.bootstrap ?: @{}} mutableCopy];
-        if (ctx) r[@"frontmost_context"]=[ctx dictionaryRepresentation]; if (runtimeError.length) r[@"error"]=runtimeError; return r;
+        NSDictionary *bootstrap = nil; BOOL complete = NO; BOOL inFlight = NO;
+        @synchronized (self) {
+            bootstrap = self.bootstrap ?: @{@"state": @"not_started"};
+            complete = self.bootstrapComplete;
+            inFlight = self.bootstrapInFlight;
+        }
+        NSMutableDictionary *r=[@{
+            @"ok": @YES, @"broker_ready": @(self.listenFD >= 0),
+            @"bootstrap": bootstrap, @"bootstrap_complete": @(complete),
+            @"bootstrap_in_flight": @(inFlight),
+            @"semantic_operational": @(self.semanticOperational)
+        } mutableCopy];
+        if (complete) {
+            r[@"runtime"] = VPhoneAXRuntimeStatus();
+            @try {
+                MCPAXQueryContext *ctx=[self context];
+                if (ctx) r[@"frontmost_context"]=[ctx dictionaryRepresentation];
+            } @catch (NSException *exception) {
+                r[@"context_error"] = exception.reason ?: exception.name;
+            }
+        }
+        return r;
+    }
+    if ([type isEqualToString:@"bootstrap"]) {
+        [self beginBootstrap:@"explicit-request"];
+        NSDictionary *bootstrap = nil; BOOL complete = NO; BOOL inFlight = NO;
+        @synchronized (self) {
+            bootstrap = self.bootstrap ?: @{@"state": @"not_started"};
+            complete = self.bootstrapComplete;
+            inFlight = self.bootstrapInFlight;
+        }
+        return @{ @"ok": @YES, @"bootstrap": bootstrap,
+                  @"bootstrap_complete": @(complete), @"bootstrap_in_flight": @(inFlight) };
     }
     MCPAXQueryContext *ctx=[self context]; if (!ctx || ctx.pid<=0) return @{ @"ok":@NO,@"error":@"no_frontmost_context" };
     if ([type isEqualToString:@"tree"]) {
         NSString *error=nil; NSDictionary *raw=[self treeForContext:ctx request:req error:&error];
-        if (!raw) { self.bootstrap=VPhoneAXBootstrapRuntime(); raw=[self treeForContext:ctx request:req error:&error]; }
-        if (!raw) return @{ @"ok":@NO,@"error":error ?: @"tree_failed" };
+        if (!raw) {
+            [self beginBootstrap:@"tree-retry"];
+            return @{ @"ok":@NO, @"error":error ?: @"tree_failed", @"bootstrap":self.bootstrap ?: @{} };
+        }
+        self.semanticOperational = YES;
         NSMutableDictionary *r=[[self semanticPayload:raw] mutableCopy]; r[@"ok"]=@YES; r[@"frontmost_context"]=[ctx dictionaryRepresentation]; return r;
     }
     if ([type isEqualToString:@"hit_test"]) {
         double x=[req[@"x"] doubleValue], y=[req[@"y"] doubleValue]; NSString *error=nil;
         NSDictionary *raw=[self.nodeSource elementAtPoint:CGPointMake(x,y) pid:ctx.pid contextId:ctx.contextId displayId:ctx.displayId allowParameterizedHitTest:YES error:&error];
         if (!raw) return @{ @"ok":@NO,@"error":error ?: @"hit_test_failed" };
+        self.semanticOperational = YES;
         uint64_t gen=++self.generation; return @{ @"ok":@YES,@"node":[self semanticNode:raw path:@"hit" generation:gen],@"generation":@(gen) };
     }
     if ([type isEqualToString:@"find"]) {
@@ -298,7 +429,6 @@ static BOOL VPAXRoleClickable(NSString *role) {
         }
         return found ?: @{ @"ok":@NO,@"error":error ?: @"find_failed" };
     }
-    if ([type isEqualToString:@"bootstrap"]) { self.bootstrap=VPhoneAXBootstrapRuntime(); return @{ @"ok":@YES,@"bootstrap":self.bootstrap }; }
     return @{ @"ok":@NO,@"error":[NSString stringWithFormat:@"unknown command: %@",type] };
 }
 @end

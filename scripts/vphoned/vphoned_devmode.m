@@ -20,6 +20,7 @@ static CFTypeRef (*pXPCToCF)(xpc_obj_t);
 static BOOL gXPCLoaded = NO;
 
 BOOL vp_devmode_load(void) {
+    if (gXPCLoaded) return YES;
     void *libxpc = dlopen("/usr/lib/system/libxpc.dylib", RTLD_NOW);
     if (!libxpc) { NSLog(@"vphoned: dlopen libxpc failed"); return NO; }
 

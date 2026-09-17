@@ -51,3 +51,21 @@ Screenshots are returned as MCP image content. Large binary transfers use explic
 ## M1 firmware patch fix
 
 Builds apply `scripts/patches/libcapstone-opcount-oob.patch` to the pinned `vendor/libcapstone-spm` checkout before compilation. The build fails instead of silently continuing if the patch stops applying cleanly after an upstream submodule change.
+
+## Semantic acceptance and broker updates
+
+Validate an already bootable JB VM with the full semantic contract:
+
+```sh
+.mcp-venv/bin/python scripts/test_semantic_vm.py codex-semantic
+```
+
+The acceptance pass verifies AX bootstrap, unique selectors, semantic tap/navigation, waits, hit testing, ambiguity rejection, bounded full trees, Unicode-safe typing with verification, foreground-app identity, the `semantic_operational` health bit, and JB variant preservation.
+
+For an existing JB VM, a VPhoneAX broker update must be persisted into the offline Preboot volume rather than copied only through the running guest. Stop the VM, then run:
+
+```sh
+./scripts/update_vphoneax_vm.sh ~/.vphone/VMs/codex-semantic /path/to/signed/VPhoneAX.dylib
+```
+
+The updater mounts only the stopped VM disk, replaces the canonical VPhoneAX dylib/filter plist in the Procursus tweak directory, syncs, and detaches. Newly created JB/EXP VMs receive the current broker through the normal CFW installer.

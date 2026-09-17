@@ -93,6 +93,15 @@ static NSDictionary *vp_ax_action(NSDictionary *msg, id reqId) {
     return vp_ax_wrap_response(result, reqId);
 }
 
+NSDictionary *vp_accessibility_frontmost_context(void) {
+    NSString *error = nil;
+    NSDictionary *response = vp_ax_request(@{@"t": @"status"}, &error);
+    if (![response isKindOfClass:[NSDictionary class]] || ![response[@"ok"] boolValue]) return nil;
+    NSDictionary *context = [response[@"frontmost_context"] isKindOfClass:[NSDictionary class]]
+        ? response[@"frontmost_context"] : nil;
+    return context;
+}
+
 NSDictionary *vp_handle_accessibility_command(NSDictionary *msg) {
     id reqId = msg[@"id"];
     NSString *type = [msg[@"t"] isKindOfClass:[NSString class]] ? msg[@"t"] : @"";

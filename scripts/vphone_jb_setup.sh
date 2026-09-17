@@ -24,11 +24,10 @@ for d in \
 done
 export PATH="${P#:}"
 
-# Redirect all output (stdout+stderr) through tee to the log + console.
-exec > >(tee -a "$LOG") 2>&1
+# Use portable append-only logging. iOS launchd jobs do not reliably provide
+# /dev/fd, so Bash process substitution (>(tee ...)) emits noisy failures.
+exec >>"$LOG" 2>&1
 
-# NOTE: log() does NOT pipe through tee — stdout is already tee'd to $LOG by the
-# exec above, so a second tee here would double every timestamped line.
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 die() { log "FATAL: $*"; exit 1; }
 

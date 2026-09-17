@@ -2422,8 +2422,13 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
     CGPoint tapPoint = CGPointMake(CGRectGetMidX(onScreen ? visibleRect : rect),
                                    CGRectGetMidY(onScreen ? visibleRect : rect));
     CGPoint centerPoint = CGPointZero;
-    if (MCPAXNodeCGPointFromObject(directValues[@"centerPoint"], &centerPoint) &&
-        CGRectContainsPoint(onScreen ? visibleRect : rect, centerPoint)) {
+    BOOL hasScreenCenterPoint =
+        MCPAXNodeCGPointFromObject(directValues[@"centerPoint"], &centerPoint) &&
+        CGRectContainsPoint(screenBounds, centerPoint);
+    // iOS 27 frequently reports compact candidate frames in window-local
+    // coordinates while AXElement.centerPoint is already display/screen space.
+    // Use the latter for interaction even when it falls outside the local rect.
+    if (hasScreenCenterPoint) {
         tapPoint = centerPoint;
     }
 
@@ -2451,7 +2456,10 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
     if (containerType) element[@"container_type"] = containerType;
     element[@"rect"] = MCPAXNodeIntegerFrameDictionary(rect);
     if (onScreen) element[@"visible_rect"] = MCPAXNodeIntegerFrameDictionary(visibleRect);
+    if (hasScreenCenterPoint) element[@"center_point"] = MCPAXNodeIntegerPointDictionary(centerPoint);
     element[@"tap"] = MCPAXNodeIntegerPointDictionary(tapPoint);
+    if (windowContextId.unsignedIntValue > 0) element[@"window_context_id"] = windowContextId;
+    if (windowDisplayId.unsignedIntValue > 0) element[@"window_display_id"] = windowDisplayId;
     if (texts.count > 0) {
         element[@"text"] = texts.firstObject;
         if (texts.count > 1) {

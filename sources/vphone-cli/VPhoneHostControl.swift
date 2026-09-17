@@ -687,10 +687,57 @@ class VPhoneHostControl {
             guard let selector = json["selector"] as? [String: Any] else {
                 throw VPhoneControl.ControlError.protocolError("accessibility_action requires selector")
             }
-            return try await ctl.accessibilityAction(
-                selector: selector, action: json["action"] as? String ?? "tap",
-                maxDepth: (json["max_depth"] as? NSNumber)?.intValue ?? 20
+            let action = (json["action"] as? String ?? "tap").lowercased()
+            guard action == "tap" else {
+                throw VPhoneControl.ControlError.protocolError(
+                    "unsupported semantic action: \(action)"
+                )
+            }
+
+            // Resolve the target through VPhoneAX immediately before acting, but
+            // inject the tap through the host VZ touchscreen. Guest-side IOKit
+            // digitizer injection is unnecessary on iOS 26+ and can destabilize
+            // SpringBoard on iOS 27.
+            let found = try await ctl.accessibilityFind(
+                selector: selector, deep: true,
+                maxDepth: (json["max_depth"] as? NSNumber)?.intValue ?? 20,
+                maxElements: 1000
             )
+            guard found["ok"] as? Bool == true else { return found }
+            guard let node = found["node"] as? [String: Any],
+                  let tap = node["tap"] as? [String: Any],
+                  let screen = found["screen"] as? [String: Any],
+                  let logicalX = (tap["x"] as? NSNumber)?.doubleValue,
+                  let logicalY = (tap["y"] as? NSNumber)?.doubleValue,
+                  let logicalWidth = (screen["width"] as? NSNumber)?.doubleValue,
+                  let logicalHeight = (screen["height"] as? NSNumber)?.doubleValue,
+                  logicalWidth > 0, logicalHeight > 0
+            else {
+                throw VPhoneControl.ControlError.protocolError(
+                    "semantic target has no actionable tap geometry"
+                )
+            }
+            guard let view = captureView, view.window != nil else {
+                throw VPhoneControl.ControlError.protocolError("no active VM view")
+            }
+
+            let pixelX = logicalX / logicalWidth * Double(screenWidth)
+            let pixelY = logicalY / logicalHeight * Double(screenHeight)
+            view.injectTap(
+                pixelX: pixelX, pixelY: pixelY,
+                screenWidth: screenWidth, screenHeight: screenHeight
+            )
+            // Ensure the synthesized mouse-up has been delivered before returning.
+            try? await Task.sleep(nanoseconds: 120_000_000)
+
+            var result = found
+            result["action"] = "tap"
+            result["tap_pixel"] = ["x": pixelX, "y": pixelY]
+            result["tap_normalized"] = [
+                "x": logicalX / logicalWidth, "y": logicalY / logicalHeight,
+            ]
+            result["injection"] = "host_vz_touchscreen"
+            return result
 
         case "location_set":
             try requireConnected()

@@ -156,6 +156,10 @@ NSDictionary *vp_handle_file_command(int fd, NSDictionary *msg) {
             if (write(tmp_fd, buf, chunk) != (ssize_t)chunk) { ok = NO; break; }
             remaining -= chunk;
         }
+        if (ok && fsync(tmp_fd) != 0) {
+            NSLog(@"vphoned: file_put fsync failed for %@: %s", path, strerror(errno));
+            ok = NO;
+        }
         close(tmp_fd);
 
         if (!ok) {
@@ -179,6 +183,12 @@ NSDictionary *vp_handle_file_command(int fd, NSDictionary *msg) {
             r[@"msg"] = [NSString stringWithFormat:@"rename failed: %s", strerror(errno)];
             return r;
         }
+
+        // Persist the directory entry too. vm stop terminates the host VM process,
+        // so returning before APFS commits the rename can otherwise resurrect the
+        // previous file on the next boot.
+        int parentFd = open([parent fileSystemRepresentation], O_RDONLY);
+        if (parentFd >= 0) { fsync(parentFd); close(parentFd); }
 
         NSLog(@"vphoned: file_put %@ (%lu bytes)", path, (unsigned long)size);
         return vp_make_response(@"ok", reqId);
