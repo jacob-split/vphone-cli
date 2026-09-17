@@ -59,6 +59,7 @@ class VPhoneControl {
     private var guestBinaryHash: String?
     private var nextRequestId: UInt64 = 0
     private var connectionAttemptToken: UInt64 = 0
+    private var connectAttemptInFlight = false
     private var reconnectWorkItem: DispatchWorkItem?
     private var reconnectWatchdog: DispatchSourceTimer?
     private var heartbeatInFlight = false
@@ -165,13 +166,26 @@ class VPhoneControl {
 
     private func attemptConnect() {
         guard let device else { return }
+        guard !connectAttemptInFlight else { return }
+        connectAttemptInFlight = true
         connectionAttemptToken += 1
         let attemptToken = connectionAttemptToken
         device.connect(toPort: Self.vsockPort) {
             [weak self] (result: Result<VZVirtioSocketConnection, any Error>) in
             Task { @MainActor in
-                guard let self else { return }
-                guard self.isCurrentAttempt(attemptToken) else { return }
+                guard let self else {
+                    if case let .success(conn) = result {
+                        Self.shutdownSocket(fd: conn.fileDescriptor)
+                    }
+                    return
+                }
+                guard self.isCurrentAttempt(attemptToken) else {
+                    if case let .success(conn) = result {
+                        Self.shutdownSocket(fd: conn.fileDescriptor)
+                    }
+                    return
+                }
+                self.connectAttemptInFlight = false
                 switch result {
                 case let .success(conn):
                     self.connection = conn
@@ -182,6 +196,7 @@ class VPhoneControl {
                 }
             }
         }
+        armConnectAttemptTimeout(attemptToken: attemptToken)
     }
 
     // MARK: - Handshake
@@ -1012,7 +1027,8 @@ class VPhoneControl {
             }
 
             // Do not overlap an in-flight handshake or an already scheduled retry.
-            guard self.connection == nil, self.reconnectWorkItem == nil else { return }
+            guard self.connection == nil, self.reconnectWorkItem == nil,
+                  !self.connectAttemptInFlight else { return }
             print("[control] reconnect watchdog: no active attempt; reconnecting now")
             self.loadGuestBinary()
             self.attemptConnect()
@@ -1051,6 +1067,22 @@ class VPhoneControl {
             print("[control] handshake timed out after \(Int(timeout.rounded()))s")
             Self.shutdownSocket(fd: fd)
             disconnect(ifCurrentAttempt: attemptToken)
+        }
+    }
+
+    private func armConnectAttemptTimeout(attemptToken: UInt64) {
+        let timeout = Self.handshakeTimeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            guard let self else { return }
+            guard self.isCurrentAttempt(attemptToken), self.connectAttemptInFlight,
+                  self.connection == nil else { return }
+            print("[control] connect attempt timed out after \(Int(timeout.rounded()))s")
+            self.connectAttemptInFlight = false
+            // Invalidate any late callback. A late successful socket is closed
+            // by the stale-attempt guard in the completion handler.
+            self.connectionAttemptToken &+= 1
+            self.loadGuestBinary()
+            self.attemptConnect()
         }
     }
 
