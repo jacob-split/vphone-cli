@@ -73,7 +73,10 @@ if [[ "$BUILD_VPHONED" -eq 1 ]]; then
   command -v ldid >/dev/null 2>&1 \
     || { echo "Error: ldid not found. Run: brew install ldid-procursus" >&2; exit 1; }
   echo "=== Building vphoned ==="
-  make -C scripts/vphoned GIT_HASH="$GIT_HASH"
+  # GIT_HASH is compiled into the daemon, but make cannot observe variable
+  # changes as file dependencies. Force this small target to rebuild so the
+  # signed/runtime daemon always identifies the source revision that built it.
+  make -C scripts/vphoned clean all GIT_HASH="$GIT_HASH"
   echo "=== Signing vphoned ==="
   mkdir -p .build
   cp scripts/vphoned/vphoned .build/vphoned.signed

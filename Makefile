@@ -259,7 +259,7 @@ bundle: build $(INFO_PLIST)
 vphoned:
 	@command -v ldid >/dev/null 2>&1 \
 		|| (echo "Error: ldid not found. Run: brew install ldid-procursus" && exit 1)
-	$(MAKE) -C $(SCRIPTS)/vphoned GIT_HASH=$(GIT_HASH)
+	$(MAKE) -C $(SCRIPTS)/vphoned clean all GIT_HASH=$(GIT_HASH)
 	@echo "=== Signing vphoned ==="
 	cp $(SCRIPTS)/vphoned/vphoned $(VM_DIR)/.vphoned.signed
 	ldid \
