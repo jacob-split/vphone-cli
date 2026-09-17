@@ -99,7 +99,11 @@ class VPhoneAppDelegate: NSObject, NSApplicationDelegate {
 
             if let device = vm.virtualMachine.socketDevices.first as? VZVirtioSocketDevice {
                 control.connect(device: device)
-                camServer.connect(device: device)
+                // A cold-boot headless worker must not block its MainActor on
+                // the optional camera port before the guest camera service is
+                // ready. Retain the device and connect lazily when a camera
+                // source is explicitly selected.
+                camServer.connect(device: device, deferred: cli.noGraphics)
             }
         }
 

@@ -52,9 +52,11 @@ final class VPhoneCameraServer {
 
     // MARK: - Lifecycle
 
-    func connect(device: VZVirtioSocketDevice) {
+    func connect(device: VZVirtioSocketDevice, deferred: Bool = false) {
         self.device = device
-        attemptConnect()
+        if !deferred {
+            attemptConnect()
+        }
     }
 
     func disconnect() {
@@ -103,6 +105,9 @@ final class VPhoneCameraServer {
                 sourceKind = .off
             }
         }
+        if kind != .off, !isConnected {
+            attemptConnect()
+        }
         if wasStreaming, producer != nil {
             startStreaming()
         }
@@ -111,7 +116,11 @@ final class VPhoneCameraServer {
     // MARK: - Streaming
 
     func startStreaming() {
-        guard producer != nil, isConnected else { return }
+        guard producer != nil else { return }
+        guard isConnected else {
+            attemptConnect()
+            return
+        }
         if timer != nil { return }
         let interval = 1.0 / Self.defaultFPS
         // Timer fires on the main queue so MainActor-isolated state
